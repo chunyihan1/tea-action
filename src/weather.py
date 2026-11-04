@@ -22,6 +22,14 @@ GEO_URL = "https://geoapi.qweather.com"
 REQUEST_TIMEOUT = 5
 # 天气数据缓存时长（秒）：实时数据 10 分钟内变化极小，足够支撑高频决策
 CACHE_TTL = 600
+# 网络失败后的短暂熔断：避免 Agent 每轮都对不可达接口重复等待完整超时。
+FAILURE_TTL = 15
+
+# 进程级缓存：Agent 每轮都会 new WeatherClient，缓存不能挂在实例上。
+_CACHE: dict[str, tuple[float, dict]] = {}
+_FAILURES: dict[str, tuple[float, str]] = {}
+_INFLIGHT: dict[str, dict] = {}
+_CACHE_LOCK = threading.Lock()
 
 
 class WeatherError(RuntimeError):
@@ -32,9 +40,8 @@ class WeatherClient:
     def __init__(self, api_key: str | None = None, demo: bool | None = None):
         self.api_key = api_key if api_key is not None else config.get_weather_api_key()
         self.demo = demo if demo is not None else (not self.api_key or config.is_demo_mode())
-        # 进程内 TTL 缓存：{"key": (expire_ts, data)}，跨实例共享（Agent 每轮 new 客户端）
-        self._cache: dict = {}
-        self._cache_lock = threading.Lock()
+        # api_key 也作为缓存命名空间，避免不同凭据/测试客户端互相污染。
+        self._cache_ns = str(self.api_key or "demo")
 
     # ---------- 基础请求 ----------
     def _get(self, base: str, path: str, params: dict) -> dict:
@@ -47,15 +54,63 @@ class WeatherClient:
         return data
 
     def _cached(self, key: str, fn) -> dict:
-        """读缓存；未命中/过期时调用 fn 并写缓存。缓存写失败/读取异常一律放行。"""
-        with self._cache_lock:
-            hit = self._cache.get(key)
+        """跨实例读缓存；同一 key 只允许一个线程刷新，其余线程复用结果。
+
+        失败结果短暂保留，避免天气接口不可达时每轮决策都等待完整网络超时。
+        """
+        cache_key = f"{self._cache_ns}:{key}"
+        now = time.monotonic()
+        with _CACHE_LOCK:
+            hit = _CACHE.get(cache_key)
             if hit is not None and hit[0] > time.monotonic():
                 return hit[1]
-        data = fn()
-        with self._cache_lock:
-            self._cache[key] = (time.monotonic() + CACHE_TTL, data)
+            failure = _FAILURES.get(cache_key)
+            if failure is not None and failure[0] > now:
+                raise WeatherError(f"天气服务暂不可用（冷却中）：{failure[1]}")
+            flight = _INFLIGHT.get(cache_key)
+            owner = flight is None
+            if owner:
+                flight = {"event": threading.Event(), "error": None, "done": False}
+                _INFLIGHT[cache_key] = flight
+
+        if not owner:
+            # 网络请求本身有 REQUEST_TIMEOUT；额外留 1 秒给响应解析/调度。
+            flight["event"].wait(timeout=REQUEST_TIMEOUT + 1)
+            with _CACHE_LOCK:
+                hit = _CACHE.get(cache_key)
+                if hit is not None and hit[0] > time.monotonic():
+                    return hit[1]
+                error = flight.get("error")
+            if error:
+                raise WeatherError(f"天气缓存刷新失败：{error}") from None
+            raise WeatherError("天气缓存刷新等待超时")
+
+        try:
+            data = fn()
+        except Exception as e:
+            with _CACHE_LOCK:
+                _FAILURES[cache_key] = (time.monotonic() + FAILURE_TTL, str(e))
+                flight["error"] = str(e)
+                flight["done"] = True
+                flight["event"].set()
+                _INFLIGHT.pop(cache_key, None)
+            raise
+
+        with _CACHE_LOCK:
+            _CACHE[cache_key] = (time.monotonic() + CACHE_TTL, data)
+            _FAILURES.pop(cache_key, None)
+            flight["done"] = True
+            flight["event"].set()
+            _INFLIGHT.pop(cache_key, None)
         return data
+
+    @staticmethod
+    def clear_cache() -> None:
+        """清空进程级缓存（配置切换或测试时使用）。"""
+        with _CACHE_LOCK:
+            _CACHE.clear()
+            _FAILURES.clear()
+            _INFLIGHT.clear()
 
     # ---------- 数据接口 ----------
     def get_now(self, location: str) -> dict:

@@ -10,6 +10,7 @@ from .devices import (
     SprayBoom,
     bus,
     DEFAULT_SNAPSHOT,
+    DEFAULT_ZONE,
 )
 
-__all__ = ["ActuatorBus", "DripValve", "SprayBoom", "bus", "DEFAULT_SNAPSHOT"]
+__all__ = ["ActuatorBus", "DripValve", "SprayBoom", "bus", "DEFAULT_SNAPSHOT", "DEFAULT_ZONE"]

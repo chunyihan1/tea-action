@@ -19,10 +19,18 @@ st.set_page_config(
 
 ui.inject_css()
 
-# 启动时初始化 MySQL 表（幂等）
-try:
+
+@st.cache_resource(ttl=3600, show_spinner=False)
+def _ensure_database_schema() -> bool:
+    """每个 Streamlit 进程最多每小时执行一次幂等建表，避免每次 rerun 都连库。"""
     db.init_db()
     db.init_db_ext()
+    return True
+
+
+# 启动时初始化 MySQL 表（成功结果缓存；失败不缓存，数据库恢复后会自动重试）
+try:
+    _ensure_database_schema()
 except Exception:  # noqa: BLE001
     pass
 

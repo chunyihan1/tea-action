@@ -1,8 +1,13 @@
-"""Agent 主循环：后台线程定时执行「采集→推理→决策→执行→落库→广播」。
+"""Agent 主循环：后台线程定时执行「采集→推理→分区决策→执行→落库→广播」。
 
 典型一轮（演示链路）：
-  USB摄像头/演示帧 → OpenCV → YOLO 推理 → Agent 决策
-  → 执行器状态更新 → 日志落库 → WebSocket 广播 → 网页动画展示
+  多路摄像头/演示帧 → OpenCV → YOLO 推理 → 按区域分别决策
+  → 各区域执行器独立动作 → 日志落库 → WebSocket 广播 → 网页分区动画展示
+
+区域模型（一个摄像头 = 一个区域）：
+  每一路摄像头画面覆盖一个独立作业区域（zone），区域各自维护病害防抖计数、
+  喷雾冷却与滴灌/喷杆状态。A 区检出病害只开 A 区喷杆，B 区完全不受影响，
+  从而实现「多区域分别执行、互不干扰」。
 
 线程安全：start/stop/step 均可从 REST API / Streamlit 调用。
 """
@@ -16,6 +21,7 @@ from typing import Callable
 
 from .. import config, db, risk
 from ..executor import bus
+from ..executor.devices import DEFAULT_SNAPSHOT, DEFAULT_ZONE
 from ..sensor import sensor
 from ..vision import annotate, camera, camera_manager, detector
 from ..weather import WeatherClient
@@ -23,6 +29,10 @@ from .daily_recorder import daily_recorder
 from .llm_decision import decide
 
 DEFAULT_GARDEN_KEY = "longjing"
+
+# 决策类型/等级优先级：多区域聚合为全场视图时取最高优先级区域
+_TYPE_PRIORITY = {"spray": 5, "cool": 5, "irrigate": 4, "irrigating": 3, "stop": 2, "noop": 1}
+_LEVEL_PRIORITY = {"high": 3, "medium": 2, "low": 1}
 
 
 class AgentRunner:
@@ -41,6 +51,8 @@ class AgentRunner:
         self._step_thread: threading.Thread | None = None     # 决策线程（与推流解耦）
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
+        # 启动/停止/切换上下文串行执行，避免 stop 尚在等旧线程时 start 又创建一组线程。
+        self._lifecycle_lock = threading.RLock()
         # REST 手动单步与后台决策线程可能同时触发，整轮决策操作必须串行。
         self._step_lock = threading.Lock()
         self._listeners: list[Callable[[dict], None]] = []
@@ -48,16 +60,23 @@ class AgentRunner:
         self.steps = 0
         self.latest: dict = {}
         self.latest_frame: dict = {}  # 最近一帧画面（stream_frame 与完整轮次都会更新，供 /api/frame 与主站实时画面读取）
-        self._decision_state: dict = {}
+        # 分区决策状态：zone_id -> 跨轮状态（防抖计数、喷雾冷却），区域之间完全隔离。
+        # 一个摄像头 = 一个区域，A 区连续检出计数不会影响 B 区。
+        self._zone_states: dict[str, dict] = {}
+        # 兼容旧属性：默认区（无摄像头/旧调用场景）的跨轮状态
+        self._decision_state: dict = self._zone_states.setdefault(DEFAULT_ZONE, {})
         # 视觉缓存：推流线程持续采集+推理，决策线程复用最新结果，两者互不阻塞
         self._cams_cache: dict | None = None
 
     # ---------- 事件订阅 ----------
     def subscribe(self, listener: Callable[[dict], None]) -> None:
-        self._listeners.append(listener)
+        with self._lock:
+            self._listeners.append(listener)
 
     def _broadcast(self, event: dict) -> None:
-        for fn in list(self._listeners):
+        with self._lock:
+            listeners = list(self._listeners)
+        for fn in listeners:
             try:
                 fn(event)
             except Exception:  # noqa: BLE001
@@ -70,26 +89,46 @@ class AgentRunner:
         user_id=0 表示游客（内置演示茶园）；登录用户使用自己的茶园 key。
         返回当前上下文信息。
         """
-        with self._lock:
-            if self.running:
-                return {"ok": False, "message": "Agent 正在运行，请先停止后再切换账号", **self.context()}
-            uid = int(user_id or 0)
-            if uid and uid != self.user_id:
-                # 登录账号：取该用户第一个茶园作为 Agent 服务茶园（无则保持默认演示茶园）。
-                # key 与 8501 主站口径一致（rdb:{id}），避免类型/格式不一致导致茶园错位
+        with self._lifecycle_lock:
+            with self._lock:
+                if self.running or self._threads_alive():
+                    return {
+                        "ok": False,
+                        "message": "Agent 正在运行或后台线程尚未退出，请停止后再切换账号",
+                        **self._context_unlocked(),
+                    }
+                uid = int(user_id or 0)
+                current_uid = self.user_id
+
+            # 数据库查询不持有状态锁，避免网络抖动阻塞推流线程读取最新状态。
+            if garden_key:
+                next_garden_key = garden_key
+            elif uid != current_uid:
+                # 切换账号但未显式指定茶园时，先回默认茶园，再尝试采用该账号首个茶园；
+                # 绝不能沿用上一个账号的 rdb:* 上下文。
+                next_garden_key = DEFAULT_GARDEN_KEY
+            else:
+                next_garden_key = self.garden_key
+            if uid and uid != current_uid:
                 try:
                     gardens = db.user_gardens(uid)
                     if gardens:
-                        self.garden_key = f"rdb:{gardens[0]['id']}"
+                        next_garden_key = f"rdb:{gardens[0]['id']}"
                 except Exception:  # noqa: BLE001
                     pass
-            if garden_key:
-                self.garden_key = garden_key
-            self.user_id = uid
-        return {"ok": True, **self.context()}
+
+            with self._lock:
+                self.garden_key = next_garden_key
+                self.user_id = uid
+                ctx = self._context_unlocked()
+        return {"ok": True, **ctx}
 
     def context(self) -> dict:
         """当前 Agent 上下文：归属账号、茶园、运行状态。"""
+        with self._lock:
+            return self._context_unlocked()
+
+    def _context_unlocked(self) -> dict:
         return {
             "user_id": self.user_id,
             "garden_key": self.garden_key,
@@ -97,7 +136,17 @@ class AgentRunner:
             "steps": self.steps,
             "interval": self.interval,
             "refresh_mode": self.refresh_mode,
+            "threads_alive": self._threads_alive(),
+            "step_busy": self._step_lock.locked(),
         }
+
+    def _threads_alive(self) -> bool:
+        return any(t is not None and t.is_alive() for t in (self._thread, self._step_thread))
+
+    def current_snapshot(self) -> dict:
+        """返回最近一次完整快照的浅拷贝，供并发 REST 读取。"""
+        with self._lock:
+            return dict(self.latest) if self.latest else {}
 
     # ---------- 配置 ----------
     def configure(self, refresh_mode: str | None = None, interval: float | None = None) -> dict:
@@ -115,12 +164,16 @@ class AgentRunner:
 
     # ---------- 生命周期 ----------
     def start(self) -> bool:
+        with self._lifecycle_lock:
+            return self._start_locked()
+
+    def _start_locked(self) -> bool:
         with self._lock:
             if self.running:
                 return False
             # 上一个循环线程还卡在采集/推理里未退出时拒绝再启动，
             # 避免两个线程并发抢摄像头/推理导致越卡越死
-            if self._thread is not None and self._thread.is_alive():
+            if self._threads_alive():
                 return False
             self.running = True
             self._stop_evt.clear()
@@ -136,16 +189,30 @@ class AgentRunner:
             return True
 
     def stop(self) -> bool:
+        with self._lifecycle_lock:
+            return self._stop_locked()
+
+    def _stop_locked(self) -> bool:
         with self._lock:
             if not self.running:
                 return False
             self.running = False
             self._stop_evt.set()
-        for t in (self._thread, self._step_thread):
-            if t is not None:
-                # 线程卡在不可中断的采集调用（摄像头句柄阻塞）时最多等 5 秒；
-                # 即使 join 超时，stop 标记已置位，线程会在下一轮循环入口退出
-                t.join(timeout=5)
+            threads = list(dict.fromkeys(
+                t for t in (self._thread, self._step_thread) if t is not None))
+        # 两个线程共享一个截止时间：总等待上限约 5 秒，而不是各等 5 秒。
+        deadline = time.monotonic() + 5.0
+        for t in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if t.is_alive():
+                t.join(timeout=remaining)
+        with self._lock:
+            if self._thread is not None and not self._thread.is_alive():
+                self._thread = None
+            if self._step_thread is not None and not self._step_thread.is_alive():
+                self._step_thread = None
         return True
 
     def _loop(self) -> None:
@@ -190,7 +257,8 @@ class AgentRunner:
         raw_frame 字段仅供内部（决策落盘每日帧），广播前统一剔除。
         """
         cams = []
-        for item in camera_manager.read_all():
+        # 显式传 Agent 归属账号，页面并发切换其他账号时也不会串用摄像头源。
+        for item in camera_manager.read_all(self.user_id):
             frame = item.get("frame")
             det = detector.detect(frame, source_hint=item.get("last_source", "demo_frame"))
             image_b64 = ""
@@ -220,7 +288,11 @@ class AgentRunner:
 
     @staticmethod
     def _merge_dets(cams: list[dict]) -> dict:
-        """合并所有源的检测结果供决策使用：病害去重、总数/置信度汇总。"""
+        """合并所有源的检测结果，仅用于「全场总览」（/api/frame、主站主画面）。
+
+        重要：分区决策不再使用该合并结果 —— 合并会让 A 区病害触发全场打药。
+        每个区域的决策改用 _zone_detections() 只取本区域这一路摄像头的结果。
+        """
         dets = [c for c in cams if c.get("detections")]
         if not dets:
             return {"source": "demo_frame", "backend": "sim",
@@ -240,6 +312,93 @@ class AgentRunner:
                 "healthy": not diseases,
             },
             "frame_shape": [480, 640],
+        }
+
+    # ---------- 区域（一个摄像头 = 一个区域） ----------
+    @staticmethod
+    def _zone_key(cam: dict) -> str:
+        """区域标识：直接复用摄像头 id（cam1/cam2…），保证一机一区。"""
+        return str(cam.get("cam_id") or DEFAULT_ZONE)
+
+    @staticmethod
+    def _zone_name(cam: dict) -> str:
+        """区域展示名：优先摄像头名称（用户可命名成"东区""西坡"等）。"""
+        return str(cam.get("name") or cam.get("cam_id") or DEFAULT_ZONE)
+
+    @staticmethod
+    def _zone_detections(cam: dict) -> dict:
+        """把单路摄像头的检测结果整理成决策引擎输入（只含本区域，不含其他区域）。"""
+        summary = cam.get("summary") or {}
+        dets = cam.get("detections") or []
+        diseases = list(summary.get("diseases") or [])
+        last_source = cam.get("last_source", "demo_frame")
+        return {
+            "source": last_source,
+            "backend": "ultralytics" if last_source in ("usb_cam", "net_cam") else "sim",
+            "detections": dets,
+            "summary": {
+                "total": int(summary.get("total", len(dets)) or 0),
+                "diseases": diseases,
+                "max_conf": float(summary.get("max_conf", 0.0) or 0.0),
+                "healthy": not diseases,
+            },
+            "frame_shape": [480, 640],
+        }
+
+    @staticmethod
+    def _pick_actuator(zone_results: list[dict]) -> dict:
+        """把多区域执行器状态聚合为全场视图（兼容旧页面/接口字段）。
+
+        只要任一区域在作业，全场视图即显示为作业中，并附带 zone_id/zone_name，
+        便于调用方知道到底是哪个区域在执行；各区域真实状态见快照的 zones 字段。
+        """
+        valve = dict(DEFAULT_SNAPSHOT["drip_valve"])
+        boom = dict(DEFAULT_SNAPSHOT["spray_boom"])
+        for z in zone_results:
+            act = z.get("actuator") or {}
+            v = act.get("drip_valve") or {}
+            if v.get("state") == "open" and valve.get("state") != "open":
+                valve = {**v, "zone_id": z["zone_id"], "zone_name": z["zone_name"]}
+            b = act.get("spray_boom") or {}
+            if b.get("state") == "on" and boom.get("state") != "on":
+                boom = {**b, "zone_id": z["zone_id"], "zone_name": z["zone_name"]}
+        return {"drip_valve": valve, "spray_boom": boom}
+
+    @staticmethod
+    def _aggregate_decision(zone_results: list[dict], ts: str) -> dict:
+        """把各区域决策聚合成一条「全场决策」记录（落库 + 旧页面展示用）。
+
+        - 决策类型/等级：取优先级最高的区域（有打药 > 灌溉 > 灌溉中 > 停止 > 无操作）
+        - 摘要：各区域摘要拼接（已带 [区域名] 前缀），便于历史记录一眼看清分区结果
+        - 动作：所有区域动作合并，每个动作带 zone_id/zone_name
+        """
+        decisions = [z.get("decision") or {} for z in zone_results]
+        if not decisions:
+            return {"ts": ts, "decision_type": "noop", "summary": "暂无区域",
+                    "overall_level": "low", "actions": [],
+                    "explanation": "", "zones": []}
+        top = max(decisions, key=lambda d: (
+            _TYPE_PRIORITY.get(d.get("decision_type"), 0),
+            _LEVEL_PRIORITY.get(d.get("overall_level"), 0)))
+        level = max((d.get("overall_level") or "low" for d in decisions),
+                    key=lambda v: _LEVEL_PRIORITY.get(v, 0))
+        actions = [a for d in decisions for a in (d.get("actions") or [])]
+        summary = "；".join(d.get("summary", "") for d in decisions if d.get("summary"))
+        return {
+            "ts": ts,
+            "decision_type": top.get("decision_type", "noop"),
+            "summary": summary,
+            "overall_level": level,
+            "actions": actions,
+            "explanation": top.get("explanation", ""),
+            "zones": [{
+                "zone_id": z.get("zone_id"),
+                "zone_name": z.get("zone_name"),
+                "decision_type": (z.get("decision") or {}).get("decision_type"),
+                "overall_level": (z.get("decision") or {}).get("overall_level"),
+                "summary": (z.get("decision") or {}).get("summary", ""),
+                "actions": (z.get("decision") or {}).get("actions", []),
+            } for z in zone_results],
         }
 
     def _stream_tick(self) -> None:
@@ -269,6 +428,8 @@ class AgentRunner:
             "data": {
                 "ts": _ts(),
                 "cams": self._strip_raw(cams),
+                # 各区域执行器实时状态：前端据此只在对应区域画喷药/滴灌动画
+                "zone_actuators": bus.snapshot_all(),
                 "steps": self.steps,
                 "running": self.running,
                 "interval": self.interval,
@@ -277,10 +438,25 @@ class AgentRunner:
         })
 
     # ---------- 单轮决策 ----------
-    def step(self) -> dict:
-        """执行一轮完整决策，返回并广播最新状态快照。"""
-        with self._step_lock:
+    def step(self, wait: bool = False) -> dict:
+        """执行一轮完整决策，返回并广播最新状态快照。
+
+        默认不排队：后台决策尚未结束时，手动触发直接返回当前快照并标记
+        skipped=True，避免重复点击或 REST 重试堆出一长串过期决策请求。
+        """
+        if not self._step_lock.acquire(blocking=wait):
+            snapshot = self.current_snapshot()
+            snapshot.update({
+                "busy": True,
+                "skipped": True,
+                "message": "上一轮决策仍在执行，已返回最近快照",
+                **self.context(),
+            })
+            return snapshot
+        try:
             return self._step_once()
+        finally:
+            self._step_lock.release()
 
     def _current_cams(self) -> tuple[list, dict, object, str]:
         """取最新视觉缓存（采集+推理结果）；缓存缺失/过期时自采一轮。
@@ -308,12 +484,16 @@ class AgentRunner:
     def _step_once(self) -> dict:
         """串行执行一次完整决策（由 step() 持锁调用）。
 
+        区域化执行：每个摄像头 = 一个区域，逐区域独立决策 → 独立执行器 → 独立落库，
+        区域之间不共享防抖计数、喷雾冷却与执行器状态（互不干扰）。
+        全场共用的只有土壤传感器与气象数据。
+
         视觉部分复用推流线程的最新缓存（采集+推理已完成），
         LLM/天气/写库等慢操作只发生在本决策线程，不影响画面推流。
         """
         garden = self._garden()
 
-        # 1) 传感器
+        # 1) 传感器（全场共用一个土壤湿度传感器）
         soil = sensor.read()
         try:
             db.log_sensor(self.garden_key, soil["type"], soil["value"], soil["unit"],
@@ -323,7 +503,6 @@ class AgentRunner:
 
         # 2) 视觉（复用推流缓存的多源采集+推理结果）
         cams, det_result, main_frame, image_b64 = self._current_cams()
-        frame_shape = det_result.get("frame_shape") or ([480, 640] if cams else [480, 640])
 
         # 2.1) 土壤湿度历史（监控台趋势图数据，最近 60 条）
         soil_history = []
@@ -333,44 +512,109 @@ class AgentRunner:
         except Exception:  # noqa: BLE001
             pass
 
-        # 3) 气象（网络不可用/无 Key 时降级演示数据）
+        # 3) 气象（网络不可用/无 Key 时降级演示数据；全场共用）
         weather, risk_result = self._weather_and_risk(garden)
 
-        # 4) 决策
-        inputs = {
-            "soil": soil,
-            "detections": det_result,
-            "weather": weather,
-            "risk": risk_result,
-            "actuators": bus.snapshot(),
-        }
-        decision = decide(inputs, self._decision_state)
+        # 4) 逐区域决策 + 执行（一个摄像头 = 一个区域）
+        if not cams:
+            # 无摄像头源：退化为「全园」单区域，行为与改造前一致
+            cams = [{
+                "cam_id": DEFAULT_ZONE, "name": "全园", "source": "", "kind": "usb",
+                "last_source": "demo_frame", "available": False, "image": "",
+                "detections": [], "summary": det_result.get("summary", {}),
+                "det_source": "demo_frame", "raw_frame": None,
+            }]
 
-        # 5) 执行
-        events = bus.apply(decision["actions"])
+        # 多区域时默认不逐区调用大模型复核（N 个区域 = N 次外部调用会拖慢整轮决策），
+        # 需要时可设 AGENT_LLM_MULTI_ZONE=1 打开。
+        multi_zone = len(cams) > 1
+        use_llm = (not multi_zone) or (os.getenv("AGENT_LLM_MULTI_ZONE", "0") == "1")
+
+        zone_results: list[dict] = []
+        events: list[dict] = []
+        for cam in cams:
+            zid = self._zone_key(cam)
+            zname = self._zone_name(cam)
+            zone_det = self._zone_detections(cam)
+            # 本区域跨轮状态：防抖计数与喷雾冷却各自独立
+            state = self._zone_states.setdefault(zid, {})
+            inputs = {
+                "soil": soil,
+                "detections": zone_det,
+                "weather": weather,
+                "risk": risk_result,
+                "actuators": bus.snapshot(zid),
+                "zone": {"id": zid, "name": zname},
+            }
+            decision = decide(inputs, state, use_llm=use_llm)
+            decision["zone_id"] = zid
+            decision["zone_name"] = zname
+            if decision.get("summary"):
+                decision["summary"] = f"[{zname}] {decision['summary']}"
+            for a in decision.get("actions") or []:
+                a["zone_id"] = zid
+                a["zone_name"] = zname
+            # 只操作本区域执行器：A 区打药不会带动 B 区喷杆
+            events.extend(bus.apply(decision.get("actions") or [], zone=zid))
+            zone_results.append({
+                "zone_id": zid,
+                "zone_name": zname,
+                "cam_id": cam.get("cam_id", zid),
+                "available": bool(cam.get("available")),
+                "source": cam.get("last_source", "demo_frame"),
+                "detections": {
+                    "total": zone_det["summary"]["total"],
+                    "diseases": zone_det["summary"]["diseases"],
+                    "max_conf": zone_det["summary"]["max_conf"],
+                    "healthy": zone_det["summary"]["healthy"],
+                },
+                "decision": decision,
+                "actuator": bus.snapshot(zid),
+            })
+
+        # 5) 超时安全停止（各区域独立计时、独立停止）
         timeout_events = bus.auto_timeout_check()
         events.extend(timeout_events)
         for event in timeout_events:
             if event.get("device") == "spray_boom" and event.get("operation") == "off":
-                # 自动停止也属于一次喷雾结束，需进入冷却期。
-                self._decision_state["last_spray_end_at"] = event.get("ts")
+                # 自动停止也属于该区域一次喷雾结束，需进入该区域自己的冷却期。
+                zid = str(event.get("zone") or DEFAULT_ZONE)
+                self._zone_states.setdefault(zid, {})["last_spray_end_at"] = event.get("ts")
 
-        # 5.1) 灌溉响应：阀门开启时土壤湿度逐步回升（模拟滴灌回水），
-        #      达到 IRRIGATE_STOP 后 Agent 会自动关阀 —— 形成「缺水→灌溉→回水→停灌」闭环
-        if bus.snapshot()["drip_valve"]["state"] == "open":
+        # 清理已移除摄像头对应的区域状态，避免残留计数影响后续同名区域
+        alive_zones = {z["zone_id"] for z in zone_results}
+        for zid in list(self._zone_states):
+            if zid not in alive_zones and zid != DEFAULT_ZONE:
+                self._zone_states.pop(zid, None)
+
+        # 5.1) 灌溉响应：任一区域阀门开启时土壤湿度逐步回升（全场共用一个土壤传感器，
+        #      多个区域同时滴灌也只按一次回水计入，避免湿度过冲）
+        if any((z["actuator"].get("drip_valve") or {}).get("state") == "open" for z in zone_results):
             sensor.irrigate(0.6)
 
-        # 6) 落库（数据库不可用时降级跳过，不影响决策链路）
+        # 6) 落库（全场一条聚合决策，动作带 zone_id；数据库不可用时降级跳过）
+        agg = self._aggregate_decision(zone_results, _ts())
         try:
-            for a in decision["actions"]:
+            for a in agg["actions"]:
                 db.log_actuator(self.garden_key, a["device"], a["op"], a.get("duration_min"),
                                 a.get("reason"), user_id=self.user_id)
-            db.log_agent_decision(self.garden_key, decision["decision_type"], decision["summary"],
-                                  inputs={"soil": soil, "detections": det_result["summary"],
-                                          "weather": self._weather_light(weather)},
-                                  actions=decision["actions"],
-                                  overall_level=decision["overall_level"],
-                                  user_id=self.user_id)
+            db.log_agent_decision(
+                self.garden_key, agg["decision_type"], agg["summary"],
+                inputs={
+                    "soil": soil,
+                    "weather": self._weather_light(weather),
+                    "zones": [{
+                        "zone_id": z["zone_id"],
+                        "zone_name": z["zone_name"],
+                        "cam_id": z["cam_id"],
+                        "detections": z["detections"],
+                        "decision_type": (z["decision"] or {}).get("decision_type"),
+                        "actuator": z["actuator"],
+                    } for z in zone_results],
+                },
+                actions=agg["actions"],
+                overall_level=agg["overall_level"],
+                user_id=self.user_id)
         except Exception:  # noqa: BLE001 - 落库失败不影响本轮执行与推送
             pass
 
@@ -388,7 +632,7 @@ class AgentRunner:
         try:
             if main_frame is not None:
                 daily_recorder.save_frame(annotate.frame_to_jpeg_bytes(main_frame))
-            daily_recorder.record(det_result.get("summary", {}), decision)
+            daily_recorder.record(det_result.get("summary", {}), agg)
         except Exception:  # noqa: BLE001 - 汇总失败不影响主链路
             pass
 
@@ -401,11 +645,14 @@ class AgentRunner:
                        "backend": det_result.get("backend", "sim"),
                        "source": det_result.get("source", "demo_frame")},
             "cams": self._strip_raw(cams),
+            # 分区结果：一个摄像头一个区域，含该区域检测、决策与执行器状态
+            "zones": zone_results,
             "soil": soil,
             "soil_history": soil_history,
             "detections": {**det_result, "image": image_b64},
-            "actuator": bus.snapshot(),
-            "decision": decision,
+            # 全场聚合视图（任一区域作业即显示作业中，带 zone_name），兼容旧页面
+            "actuator": self._pick_actuator(zone_results),
+            "decision": agg,
             "events": events,
             "steps": self.steps,
             "running": self.running,

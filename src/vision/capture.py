@@ -204,6 +204,8 @@ class CameraCapture:
         self._latest_frame: np.ndarray | None = None
         self._bg_stop = threading.Event()
         self._bg_thread: threading.Thread | None = None
+        # 后台线程的创建/停止/重启互斥，避免两个调用同时看到“未启动”后各起一个线程。
+        self._bg_lock = threading.Lock()
         self._read_busy = False   # 上次限时 read 超时后标记：不重复创建超时线程
         # 不在此处启动后台线程：模块级单例（camera / camera_manager）导入时
         # 若立即启动会抢摄像头/起线程（pytest 导入即并发构造导致原生崩溃）。
@@ -216,12 +218,15 @@ class CameraCapture:
         后台线程自身，绝不拖累 Agent —— 这是根治「摄像头假成功/句柄漂移导致
         越跑越卡、Agent 启动不了/停不掉」的关键。
         """
-        if self._bg_thread is not None and self._bg_thread.is_alive():
-            return
-        self._bg_stop.clear()
-        self._bg_thread = threading.Thread(target=self._bg_loop, daemon=True,
-                                           name=f"cam-bg-{self.index}-{self.source[:24]}")
-        self._bg_thread.start()
+        with self._bg_lock:
+            if self._bg_thread is not None and self._bg_thread.is_alive():
+                return
+            self._bg_stop.clear()
+            self._bg_thread = threading.Thread(
+                target=self._bg_loop, daemon=True,
+                name=f"cam-bg-{self.index}-{self.source[:24]}",
+            )
+            self._bg_thread.start()
 
     def _bg_loop(self) -> None:
         """后台采集循环：打开→读→缓存最新有效帧；失败走快速降级休眠。
@@ -238,6 +243,8 @@ class CameraCapture:
                     continue
                 frame = self._read_valid_frame()
                 if frame is not None:
+                    if self._bg_stop.is_set():
+                        break
                     with self._frame_lock:
                         self._latest_frame = frame
                         self.last_source = self._src_tag()
@@ -254,6 +261,8 @@ class CameraCapture:
                 self._open()
                 frame = self._read_valid_frame()
                 if frame is not None:
+                    if self._bg_stop.is_set():
+                        break
                     with self._frame_lock:
                         self._latest_frame = frame
                         self.last_source = self._src_tag()
@@ -264,6 +273,15 @@ class CameraCapture:
                 self._bg_stop.wait(2.0)
             except Exception:  # noqa: BLE001 - 单轮失败不退出循环，降级窗口后重试
                 self._bg_stop.wait(2.0)
+        if self._bg_stop.is_set():
+            # release() 的 join 可能超时；旧线程退出前主动摘除它最后创建的句柄。
+            with self._lock:
+                cap = self._cap
+                self._cap = None
+            self._release_cap(cap)
+        with self._bg_lock:
+            if self._bg_thread is threading.current_thread():
+                self._bg_thread = None
 
     @property
     def kind(self) -> str:
@@ -491,8 +509,6 @@ class CameraCapture:
 
     def _ensure_bg(self) -> None:
         """确保本源的常驻后台采集线程已启动（未启动或已退出则启动）。"""
-        if self._bg_thread is not None and self._bg_thread.is_alive():
-            return
         self._start_bg()
 
     def read_frame(self) -> np.ndarray | None:
@@ -521,11 +537,13 @@ class CameraCapture:
         先停线程再释放句柄：避免后台采集线程与释放动作并发触碰同一设备
         （并发构造/释放是 MSMF access violation 崩溃的根因）。
         """
-        self._bg_stop.set()
+        with self._bg_lock:
+            self._bg_stop.set()
+            bg_thread = self._bg_thread
         # 等待后台线程退出（正常 2s 内；卡在原生调用时最多等 5s，
         # join 超时也不强杀——卡住的线程由实例锁隔离，只会让该源降级）
-        if self._bg_thread is not None and self._bg_thread.is_alive():
-            self._bg_thread.join(timeout=5)
+        if bg_thread is not None and bg_thread.is_alive():
+            bg_thread.join(timeout=5)
         with self._lock:
             if self._cap is not None:
                 cap = self._cap
@@ -533,7 +551,8 @@ class CameraCapture:
                 self._release_cap(cap)
         with self._frame_lock:
             self._latest_frame = None
-        self._bg_stop.clear()  # 允许下次 _start_bg() 重启采集
+        # 不在这里 clear：若 join 超时，旧线程可能仍在运行；下一轮启动会先检查
+        # 旧线程是否真正退出，再 clear stop 并创建新线程，避免旧线程“复活”后双采集。
 
 
 # 模块级单例（惰性创建，避免无摄像头环境启动报错）
@@ -574,11 +593,24 @@ class CameraManager:
         self._pool: dict[str, CameraCapture] = {}
         # source -> 引用该采集器的 user_id 集合（池实例何时可释放）
         self._refs: dict[str, set[int]] = {}
+        # 账号视图缓存：Agent 读取自己账号的摄像头时，不受其他页面切换全局视图影响。
+        # user_id -> [(cam_id, CameraCapture, meta), ...]
+        self._view_cache: dict[int, list[tuple[str, CameraCapture, dict]]] = {}
+        self._view_load_lock = threading.Lock()
 
     # ---------- 内部 ----------
     def _next_id(self) -> str:
         self._seq += 1
         return f"cam{self._seq}"
+
+    def _active_snapshot_locked(self) -> list[tuple[str, CameraCapture, dict]]:
+        return [
+            (cam_id, self._cams[cam_id], dict(self._meta.get(cam_id, {})))
+            for cam_id in list(self._cams)
+        ]
+
+    def _remember_active_locked(self, user_id: int) -> None:
+        self._view_cache[int(user_id or 0)] = self._active_snapshot_locked()
 
     def _pool_get(self, source: str, name: str = "") -> CameraCapture:
         """从全局池取采集实例（不存在则创建）。物理设备同一 source 只开一个。"""
@@ -616,12 +648,18 @@ class CameraManager:
                     "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 self._seq = 1
+                self._remember_active_locked(user_id)
                 return
+            seen_sources: set[str] = set()
             for s in sources:
                 cam_key = s.get("cam_key") or self._next_id()
                 src = s.get("source") or ""
                 if not src.lower().startswith(("usb:", "rtsp://", "http://", "https://")):
                     continue
+                # 同一账号重复添加同一物理源没有意义，也会破坏池引用计数。
+                if src in seen_sources:
+                    continue
+                seen_sources.add(src)
                 inst = self._pool_get(src, s.get("name") or "")
                 self._refs.setdefault(src, set()).add(int(user_id or 0))
                 self._cams[cam_key] = inst
@@ -634,6 +672,7 @@ class CameraManager:
                 m = re.match(r"cam(\d+)", cam_key)
                 if m:
                     self._seq = max(self._seq, int(m.group(1)))
+            self._remember_active_locked(user_id)
 
     def set_user(self, user_id: int, force: bool = False) -> None:
         """切换当前账号视图（游客 0 / 登录用户 id）。切换只换视图，不释放池实例。
@@ -644,6 +683,9 @@ class CameraManager:
         with self._lock:
             if not force and self._loaded and self._user_id == int(user_id or 0):
                 return
+            if self._loaded:
+                # 切走前保存旧视图，Agent/页面之后可无数据库查询直接恢复。
+                self._remember_active_locked(self._user_id)
             self._user_id = int(user_id or 0)
             self._loaded = True
         self._load_user_sources(self._user_id)
@@ -651,6 +693,80 @@ class CameraManager:
     def _ensure_loaded(self) -> None:
         if not self._loaded:
             self.set_user(0)
+
+    def _load_camera_view(self, user_id: int) -> list[tuple[str, CameraCapture, dict]]:
+        """按账号加载独立摄像头视图；不修改当前页面正在使用的全局视图。"""
+        uid = int(user_id or 0)
+        with self._view_load_lock:
+            with self._lock:
+                cached = self._view_cache.get(uid)
+                if cached is not None:
+                    return list(cached)
+
+            from .. import db
+            try:
+                sources = db.user_cameras(uid)
+            except Exception:  # noqa: BLE001 - 数据库不可用时回退默认源
+                sources = []
+
+            with self._lock:
+                cached = self._view_cache.get(uid)
+                if cached is not None:
+                    return list(cached)
+                view: list[tuple[str, CameraCapture, dict]] = []
+                seen_sources: set[str] = set()
+                seq = 0
+                if not sources:
+                    src = self._default_source()
+                    inst = self._pool_get(src, "默认摄像头")
+                    self._refs.setdefault(src, set()).add(uid)
+                    meta = {
+                        "id": "cam1", "name": inst.name, "source": src,
+                        "kind": inst.kind, "enabled": True,
+                        "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    view.append(("cam1", inst, meta))
+                    seq = 1
+                else:
+                    for source_row in sources:
+                        src = source_row.get("source") or ""
+                        if not src.lower().startswith(("usb:", "rtsp://", "http://", "https://")):
+                            continue
+                        if src in seen_sources:
+                            continue
+                        seen_sources.add(src)
+                        seq += 1
+                        cam_key = source_row.get("cam_key") or f"cam{seq}"
+                        match = re.match(r"cam(\d+)", cam_key)
+                        if match:
+                            seq = max(seq, int(match.group(1)))
+                        inst = self._pool_get(src, source_row.get("name") or "")
+                        self._refs.setdefault(src, set()).add(uid)
+                        meta = {
+                            "id": cam_key,
+                            "name": source_row.get("name") or inst.name,
+                            "source": src,
+                            "kind": inst.kind,
+                            "enabled": bool(source_row.get("enabled", 1)),
+                            "added_at": str(
+                                source_row.get("created_at")
+                                or time.strftime("%Y-%m-%d %H:%M:%S")
+                            ),
+                        }
+                        view.append((cam_key, inst, meta))
+                self._view_cache[uid] = view
+                return list(view)
+
+    def _view_for_user(self, user_id: int | None = None) -> list[tuple[str, CameraCapture, dict]]:
+        self._ensure_loaded()
+        uid = self._user_id if user_id is None else int(user_id or 0)
+        with self._lock:
+            if self._loaded and uid == self._user_id:
+                return self._active_snapshot_locked()
+            cached = self._view_cache.get(uid)
+            if cached is not None:
+                return list(cached)
+        return self._load_camera_view(uid)
 
     # ---------- 查询 ----------
     def list(self) -> list[dict]:
@@ -666,6 +782,18 @@ class CameraManager:
                 })
                 out.append(meta)
             return out
+
+    def list_for_user(self, user_id: int) -> list[dict]:
+        """只读某账号的摄像头视图，不切换全局 active user。"""
+        out = []
+        for _cam_id, inst, meta in self._view_for_user(user_id):
+            item = dict(meta)
+            item.update({
+                "available": inst.available,
+                "last_source": inst.last_source,
+            })
+            out.append(item)
+        return out
 
     def get(self, cam_id: str) -> CameraCapture | None:
         self._ensure_loaded()
@@ -691,6 +819,9 @@ class CameraManager:
         self._ensure_loaded()
         uid = self._user_id if user_id is None else int(user_id or 0)
         with self._lock:
+            for existing in self._meta.values():
+                if existing.get("source") == src:
+                    return dict(existing)
             cam_key = self._next_id()
             inst = self._pool_get(src, name.strip() or None)
             self._refs.setdefault(src, set()).add(uid)
@@ -701,6 +832,7 @@ class CameraManager:
                 "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             meta = dict(self._meta[cam_key])
+            self._view_cache.pop(uid, None)
         try:
             from .. import db
             db.add_camera(uid, cam_key, meta["name"], src)
@@ -716,6 +848,7 @@ class CameraManager:
         with self._lock:
             inst = self._cams.pop(cam_id, None)
             self._meta.pop(cam_id, None)
+            self._view_cache.pop(uid, None)
             if inst is None:
                 return False
             src = inst.source
@@ -736,17 +869,14 @@ class CameraManager:
         return True
 
     # ---------- 采集 ----------
-    def read_all(self) -> list[dict]:
-        """依次读取当前账号所有启用源的一帧（由 runner 调用，返回帧 + 来源标记）。
+    def read_all(self, user_id: int | None = None) -> list[dict]:
+        """依次读取指定账号所有启用源的一帧（由 runner 调用，返回帧 + 来源标记）。
 
         先在锁内取「cam_id + 实例 + 元信息」快照，再在锁外逐个读帧：
         set_user 切账号（clear/重建 _cams）与 read_all 并发时不会触发
         RuntimeError: dictionary changed size during iteration。
         """
-        self._ensure_loaded()
-        with self._lock:
-            snapshot = [(cam_id, inst, meta) for cam_id, inst, meta in
-                        ((cid, self._cams[cid], self._meta.get(cid, {})) for cid in list(self._cams.keys()))]
+        snapshot = self._view_for_user(user_id)
         out = []
         for cam_id, inst, meta in snapshot:
             try:

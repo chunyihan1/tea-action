@@ -147,11 +147,14 @@ def _llm_judge(client: QwenClient, inputs: dict, cand: dict) -> dict | None:
     }
 
 
-def decide(inputs: dict, state: dict | None = None) -> dict:
-    """决策入口：规则引擎先算（防抖/阈值），配置千问 Key 时由大模型复核判断。"""
+def decide(inputs: dict, state: dict | None = None, use_llm: bool = True) -> dict:
+    """决策入口：规则引擎先算（防抖/阈值），配置千问 Key 时由大模型复核判断。
+
+    use_llm=False 时只走规则引擎（多区域并行时避免逐区外部调用拖慢整轮决策）。
+    """
     cand = rule.decide(inputs, state)          # 规则候选（含防抖计数更新）
     client = QwenClient()
-    if client.demo:                            # 无 QWEN_API_KEY：完全按规则判断
+    if not use_llm or client.demo:             # 无 Key / 未启用大模型：完全按规则判断
         cand["explanation"] = client._demo_explain(cand, _ctx(inputs, cand))
         return cand
     llm_dec = _llm_judge(client, inputs, cand)  # 有 Key：千问大模型判断

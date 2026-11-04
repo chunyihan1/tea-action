@@ -125,8 +125,9 @@ def main() -> None:
 
     st.title("🤖 智能执行（Agent 控制台）")
     st.caption(
-        "演示链路：USB摄像头/演示帧 → OpenCV → YOLO 推理 → Agent 决策 "
+        "演示链路：USB摄像头/演示帧 → OpenCV → YOLO 推理 → Agent 分区决策 "
         "→ WebSocket 推送 → 网页动态展示（喷杆喷头 / 滴灌阀门）。"
+        "**一个摄像头 = 一个区域**：各区域分别决策、独立启停执行器，互不干扰。"
     )
 
     garden = ui.select_garden()
@@ -155,7 +156,10 @@ def main() -> None:
             r = _api("/api/agent/stop", "POST", data={"user_id": uid})
             st.toast("Agent 已停止" if r.get("ok") else f"停止失败：{r.get('message')}")
         if alive and st.button("⚡ 立即执行一步", width="stretch"):
-            _api("/api/agent/step", "POST", timeout=30, data={"user_id": uid})
+            r = _api("/api/agent/step", "POST", timeout=30, data={"user_id": uid})
+            snap = r.get("snapshot") or {}
+            if snap.get("skipped"):
+                st.toast("上一轮仍在执行，已显示最近结果")
             st.rerun()
 
     if not alive:
@@ -292,12 +296,21 @@ def main() -> None:
         if hist.get("items"):
             st.divider()
             st.subheader("📜 Agent 决策历史")
-            rows = [{
-                "时间": _fmt_time(i.get("created_at")),
-                "决策": DECISION_CN.get(i.get("decision_type"), i.get("decision_type")),
-                "等级": LEVEL_CN.get(i.get("overall_level", "low")),
-                "摘要": (i.get("summary") or "")[:80],
-            } for i in hist["items"][:10]]
+            rows = []
+            for i in hist["items"][:10]:
+                # 区域列：优先取本轮分区决策里的区域名，旧记录退回动作里的 zone_name
+                znames = [z.get("zone_name") for z in ((i.get("inputs") or {}).get("zones") or [])
+                          if z.get("zone_name")]
+                for a in i.get("actions") or []:
+                    if a.get("zone_name") and a["zone_name"] not in znames:
+                        znames.append(a["zone_name"])
+                rows.append({
+                    "时间": _fmt_time(i.get("created_at")),
+                    "区域": "、".join(znames) or "-",
+                    "决策": DECISION_CN.get(i.get("decision_type"), i.get("decision_type")),
+                    "等级": LEVEL_CN.get(i.get("overall_level", "low")),
+                    "摘要": (i.get("summary") or "")[:80],
+                })
             st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
     # ---------- 右：传感器 + 执行器 ----------
@@ -307,21 +320,58 @@ def main() -> None:
         if soil:
             v = float(soil.get("value", 0))
             st.metric("土壤湿度", f"{v:.1f}%", "缺水<45 · 适宜60-80")
+
+        # 分区执行器：一个摄像头 = 一个区域，各区独立决策与作业
+        zones = snap.get("zones") or []
         act = snap.get("actuator") or {}
-        valve = act.get("drip_valve") or {}
-        boom = act.get("spray_boom") or {}
-        m1, m2 = st.columns(2)
-        m1.metric("滴灌阀门", "开" if valve.get("state") == "open" else "关",
-                  f"{valve.get('flow_rate', 0):.0f} L/h")
-        m2.metric("喷杆喷头", "喷雾中" if boom.get("state") == "on" else "停",
-                  f"{boom.get('nozzle_pressure', 0):.1f} bar")
+        st.markdown("**🗺 分区执行（一个摄像头一个区域，互不干扰）**")
+        if zones:
+            zrows = []
+            for z in zones:
+                za = z.get("actuator") or {}
+                zv = za.get("drip_valve") or {}
+                zb = za.get("spray_boom") or {}
+                det = z.get("detections") or {}
+                zd = z.get("decision") or {}
+                diseases = det.get("diseases") or []
+                zrows.append({
+                    "区域": z.get("zone_name") or z.get("zone_id"),
+                    "摄像头": z.get("cam_id"),
+                    "本区检出": f"{int(det.get('total', 0))} 处"
+                                + (f"（{'/'.join(diseases)}）" if diseases else "（无病害）"),
+                    "本区决策": DECISION_CN.get(zd.get("decision_type"),
+                                                zd.get("decision_type") or "-"),
+                    "滴灌": "开" if zv.get("state") == "open" else "关",
+                    "喷杆": "喷雾中" if zb.get("state") == "on" else "停",
+                })
+            st.dataframe(pd.DataFrame(zrows), width="stretch", hide_index=True)
+            busy = [z for z in zones
+                    if ((z.get("actuator") or {}).get("drip_valve") or {}).get("state") == "open"
+                    or ((z.get("actuator") or {}).get("spray_boom") or {}).get("state") == "on"]
+            busy_txt = "、".join(z.get("zone_name") or z.get("zone_id") for z in busy) or "无"
+            st.caption(f"{len(zones)} 个区域，正在作业：{busy_txt}。各区域执行器互相独立，"
+                       "A 区检出病害只开 A 区喷杆，不会影响 B 区。")
+        else:
+            # 兼容旧快照（无 zones 字段）：按全场单区展示
+            valve = act.get("drip_valve") or {}
+            boom = act.get("spray_boom") or {}
+            m1, m2 = st.columns(2)
+            m1.metric("滴灌阀门", "开" if valve.get("state") == "open" else "关",
+                      f"{valve.get('flow_rate', 0):.0f} L/h")
+            m2.metric("喷杆喷头", "喷雾中" if boom.get("state") == "on" else "停",
+                      f"{boom.get('nozzle_pressure', 0):.1f} bar")
 
         dec = snap.get("decision") or {}
         if dec:
             st.divider()
-            st.subheader("🤖 最近决策")
-            st.markdown(f"**{DECISION_CN.get(dec.get('decision_type'), dec.get('decision_type'))}**"
+            st.subheader("🤖 最近决策（分区）")
+            st.markdown(f"**全场：{DECISION_CN.get(dec.get('decision_type'), dec.get('decision_type'))}**"
                         f" ｜ 等级：{LEVEL_CN.get(dec.get('overall_level', 'low'))}")
+            for z in dec.get("zones") or []:
+                st.markdown(
+                    f"- **{z.get('zone_name')}**："
+                    f"{DECISION_CN.get(z.get('decision_type'), z.get('decision_type'))}"
+                    f" ｜ {(z.get('summary') or '').split('] ', 1)[-1][:60]}")
             st.write(dec.get("summary", ""))
             exp = dec.get("explanation") or ""
             if exp:
@@ -329,7 +379,8 @@ def main() -> None:
             for a in dec.get("actions", []):
                 dev = "滴灌阀门" if a.get("device") == "drip_valve" else "喷杆喷头"
                 op = "开启" if a.get("op") in ("open", "on") else "关闭"
-                st.markdown(f"- **{dev} → {op}**：{a.get('reason', '')}")
+                zone_tag = f"[{a.get('zone_name')}] " if a.get("zone_name") else ""
+                st.markdown(f"- **{zone_tag}{dev} → {op}**：{a.get('reason', '')}")
 
         st.divider()
         st.markdown("### 🖥 动态动画网页")
@@ -344,7 +395,8 @@ def main() -> None:
         _mode_label = "持续录像" if status.get("refresh_mode") == "stream" \
             else f"{float(status.get('interval', 5.0) or 5.0):.1f}s 间隔"
         st.caption(f"Agent 状态：{'🟢 运行中' if status.get('running') else '⚪ 已停止'} ｜ "
-                   f"已执行 {status.get('steps', 0)} 轮 ｜ 刷新：{_mode_label}")
+                   f"已执行 {status.get('steps', 0)} 轮 ｜ 刷新：{_mode_label}"
+                   f"{' ｜ 本轮决策中' if status.get('step_busy') else ''}")
 
 
 def _render_history(garden: dict, uid: int = 0) -> None:

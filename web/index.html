@@ -151,7 +151,7 @@
   .spark-wrap svg { width: 100%; height: 52px; display: block; background: rgba(0,0,0,.25); border-radius: 8px; }
   /* ---- 决策面板 ---- */
   .decision-type { font-size: 20px; font-weight: 700; margin: 2px 0 8px; }
-  .decision-summary { font-size: 12px; color: var(--dim); line-height: 1.6; }
+  .decision-summary { font-size: 12px; color: var(--dim); line-height: 1.6; white-space: pre-wrap; }
   .decision-explain { margin-top: 10px; padding: 10px 12px; border-radius: 10px;
     background: linear-gradient(135deg, rgba(96,200,140,.14), rgba(64,150,110,.10));
     border: 1px solid rgba(96,200,140,.35); font-size: 13px; line-height: 1.7; color: var(--text); }
@@ -170,6 +170,29 @@
   .act-state.open, .act-state.on { color: var(--cyan); }
   .act-state.closed, .act-state.off { color: var(--dim); }
   .act-meta { font-size: 11px; color: var(--dim); margin-top: 3px; }
+  /* ---- 分区执行器（一个摄像头 = 一个区域，各区独立作业） ---- */
+  .act-zone-title { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line);
+    font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 8px; }
+  .act-zone-title b { color: var(--cyan); font-weight: 700; }
+  .zone-acts { margin-top: 8px; }
+  .zone-act { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 7px 9px; border-radius: 9px; background: var(--card2);
+    border: 1px solid var(--line); font-size: 12px; margin-bottom: 6px; }
+  .zone-act.active { border-color: var(--cyan); box-shadow: inset 0 0 0 1px rgba(56,214,196,.22); }
+  .zone-act .za-name { font-weight: 700; }
+  .zone-act .za-id { color: var(--dim); font-size: 10px; }
+  .zone-act .za-badge { padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line);
+    color: var(--dim); font-size: 11px; white-space: nowrap; }
+  .zone-act .za-badge.spray { border-color: var(--cyan); color: var(--cyan); }
+  .zone-act .za-badge.valve { border-color: var(--blue); color: var(--blue); }
+  .zone-act .za-tip { margin-left: auto; color: var(--dim); font-size: 10px; text-align: right; }
+  .cam-zone { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .cam-zone .zname { font-size: 10px; color: var(--dim); }
+  .cam-zone .zb { font-size: 10px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--dim); white-space: nowrap; }
+  .cam-zone .zb.spray { border-color: var(--cyan); color: var(--cyan); }
+  .cam-zone .zb.valve { border-color: var(--blue); color: var(--blue); }
+  .cam-zone .zb.idle { opacity: .8; }
   /* 流水动画 */
   .flow { animation: dashmove 1.2s linear infinite; }
   @keyframes dashmove { to { stroke-dashoffset: -24; } }
@@ -190,7 +213,7 @@
 <body>
 <header>
   <h1>🍵 茶园智能执行 · 监控台</h1>
-  <span class="sub">多路摄像头 → YOLO推理 → Agent决策 → WebSocket推送 → 实时监控</span>
+  <span class="sub">多路摄像头 → YOLO推理 → Agent分区决策 → WebSocket推送 → 实时监控（一个摄像头 = 一个区域）</span>
   <span id="agentPill" class="status-pill stopped"><span class="dot"></span><span id="agentPillText">服务未连接</span></span>
   <span id="stepPill" class="status-pill"><span class="dot"></span>决策轮次 <b id="steps">0</b></span>
   <span id="camPill" class="status-pill"><span class="dot"></span><span id="camPillText">摄像头…</span></span>
@@ -274,7 +297,7 @@
 
   <!-- 右：执行器 -->
   <section class="card">
-    <h2>⚙️ 执行器状态</h2>
+    <h2>⚙️ 执行器状态（按区域）</h2>
 
     <!-- 滴灌阀门 -->
     <div class="act-row">
@@ -326,6 +349,12 @@
       </div>
     </div>
 
+    <!-- 分区状态：一个摄像头一个区域，各区域独立作业、互不干扰 -->
+    <div class="act-zone-title">🗺 分区状态 <b id="mainActZone">主作业区域：--</b></div>
+    <div class="zone-acts" id="zoneActList">
+      <div class="empty">等待区域数据…</div>
+    </div>
+
     <div style="margin-top:10px; font-size:11px; color:var(--dim); line-height:1.6" id="eventLog">
       最近事件：等待中…
     </div>
@@ -354,6 +383,16 @@ function soilStyle(v, valveOpen) {
 
 // ================= 摄像头监控网格 =================
 const camCards = {};  // cam_id -> DOM 引用
+// 分区执行器状态：zone_id(=cam_id) -> {drip_valve:{...}, spray_boom:{...}}
+// 一个摄像头 = 一个区域，A 区喷药不影响 B 区
+let zoneActState = {};
+let lastZones = [];   // 最近一次完整快照的 zones（stream_frame 时复用，仅刷新执行器状态）
+
+function esc(v) {
+  return String(v == null ? "" : v).replace(/[&<>"']/g, ch => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]
+  ));
+}
 
 function ensureCamCard(c) {
   if (camCards[c.cam_id]) return camCards[c.cam_id];
@@ -373,6 +412,7 @@ function ensureCamCard(c) {
       <div class="cam-name"><span class="dot"></span><span class="nm"></span></div>
       <div class="det-list"></div>
       <div class="summary-line"></div>
+      <div class="cam-zone"></div>
     </div>`;
   card.querySelector(".cam-del").onclick = () => removeCam(c.cam_id);
   $("camGrid").appendChild(card);
@@ -387,9 +427,22 @@ function ensureCamCard(c) {
     nm: card.querySelector(".cam-name .nm"),
     dets: card.querySelector(".det-list"),
     sm: card.querySelector(".summary-line"),
+    zone: card.querySelector(".cam-zone"),
   };
   camCards[c.cam_id] = refs;
   return refs;
+}
+
+// 摄像头卡片底部：显示该画面所属区域 + 本区执行器是否在作业
+function renderCamZone(refs, camId, name) {
+  const a = zoneActState[camId] || {};
+  const valve = (a.drip_valve || {}).state === "open";
+  const boom = (a.spray_boom || {}).state === "on";
+  let html = `<span class="zname">区域：${esc(name || camId)}</span>`;
+  if (boom) html += `<span class="zb spray">🚿 本区喷雾中</span>`;
+  if (valve) html += `<span class="zb valve">💧 本区滴灌中</span>`;
+  if (!boom && !valve) html += `<span class="zb idle">✓ 本区待机</span>`;
+  refs.zone.innerHTML = html;
 }
 
 function removeCamCard(camId) {
@@ -427,6 +480,8 @@ function renderCams(cams) {
     refs.sm.textContent = sm.total !== undefined
       ? `共检出 ${sm.total} 处 · ${sm.diseases && sm.diseases.length ? "病害: " + sm.diseases.join("、") : "无病害"}`
       : "等待检测…";
+    // 区域执行器状态：只显示本画面所属区域，避免"全场都在喷"的错觉
+    renderCamZone(refs, c.cam_id, c.name || c.cam_id);
   });
   const n = (cams || []).length;
   $("camCountText").textContent = n + " 路画面";
@@ -500,6 +555,69 @@ function renderSoil(s) {
   drawSoilSpark(s.soil_history);
 }
 
+// ================= 分区执行器（一个摄像头 = 一个区域） =================
+function zoneBrief(z) {
+  const a = z.actuator || {};
+  const valve = (a.drip_valve || {}).state === "open";
+  const boom = (a.spray_boom || {}).state === "on";
+  return { valve, boom, act: a };
+}
+
+function renderZoneList(zones, fallbackActuator) {
+  const wrap = $("zoneActList");
+  if (!zones || !zones.length) {
+    const act = fallbackActuator || {};
+    const valve = (act.drip_valve || {}).state === "open";
+    const boom = (act.spray_boom || {}).state === "on";
+    wrap.innerHTML = `
+      <div class="zone-act${(valve || boom) ? " active" : ""}">
+        <span class="za-name">全园</span><span class="za-id">global</span>
+        <span class="za-badge${valve ? " valve" : ""}">💧 滴灌 ${valve ? "开" : "关"}</span>
+        <span class="za-badge${boom ? " spray" : ""}">🚿 喷杆 ${boom ? "喷雾中" : "停"}</span>
+        <span class="za-tip">未检测到摄像头区域，按全园统一执行</span>
+      </div>`;
+    $("mainActZone").textContent = "主作业区域：全园";
+    renderValve(act.drip_valve || {});
+    renderBoom(act.spray_boom || {});
+    return;
+  }
+  wrap.innerHTML = zones.map(z => {
+    const { valve, boom, act } = zoneBrief(z);
+    const d = z.decision || {};
+    const det = z.detections || {};
+    const tip = boom && act.spray_boom && act.spray_boom.duration_min
+      ? `计划 ${act.spray_boom.duration_min} 分钟`
+      : `检出 ${det.total || 0} 处` + (det.diseases && det.diseases.length ? `（${esc(det.diseases.join("、"))}）` : "（无病害）");
+    return `
+      <div class="zone-act${(valve || boom) ? " active" : ""}">
+        <span class="za-name">${esc(z.zone_name || z.zone_id)}</span>
+        <span class="za-id">${esc(z.zone_id)}</span>
+        <span class="za-badge${valve ? " valve" : ""}">💧 滴灌 ${valve ? "开" : "关"}</span>
+        <span class="za-badge${boom ? " spray" : ""}">🚿 喷杆 ${boom ? "喷雾中" : "停"}</span>
+        <span class="za-tip">${DECISION_CN[d.decision_type] || d.decision_type || "--"} · ${tip}</span>
+      </div>`;
+  }).join("");
+
+  // 大图标动画只反映「主作业区域」（优先喷药中 → 滴灌中 → 第一个区域），
+  // 不再把某一区的作业状态显示成全园都在喷。
+  let primary = zones.find(z => zoneBrief(z).boom)
+    || zones.find(z => zoneBrief(z).valve)
+    || zones[0];
+  const pz = zoneBrief(primary);
+  $("mainActZone").textContent = `主作业区域：${primary.zone_name || primary.zone_id}`;
+  renderValve(pz.act.drip_valve || {});
+  renderBoom(pz.act.spray_boom || {});
+}
+
+function renderZones(s) {
+  // zones 是完整快照里的分区结果（含本区检测、决策、执行器状态）
+  if (s.zones && s.zones.length) {
+    lastZones = s.zones;
+    s.zones.forEach(z => { zoneActState[z.zone_id] = z.actuator || {}; });
+  }
+  renderZoneList(lastZones, s.actuator);
+}
+
 // ================= 主快照渲染 =================
 function render(s) {
   // Agent 状态
@@ -511,6 +629,9 @@ function render(s) {
   $("steps").textContent = s.steps || 0;
   $("modelTag").textContent = (s.detections && s.detections.backend === "ultralytics")
     ? "YOLO 模型" : "模拟检测(降级)";
+
+  // 分区执行器状态先行更新，摄像头卡片才能显示各自区域的作业状态
+  renderZones(s);
 
   // 摄像头监控网格
   renderCams(camsFromSnapshot(s));
@@ -539,22 +660,29 @@ function render(s) {
     el.className = "action-item";
     const dev = a.device === "drip_valve" ? "滴灌阀门" : "喷杆喷头";
     const op = a.op === "open" || a.op === "on" ? "开启" : "关闭";
-    el.innerHTML = `<b>${dev} → ${op}</b>${a.duration_min ? `（约 ${a.duration_min} 分钟）` : ""}<br>${a.reason || ""}`;
+    const zoneTag = a.zone_name ? `[${esc(a.zone_name)}] ` : "";
+    el.innerHTML = `<b>${zoneTag}${dev} → ${op}</b>${a.duration_min ? `（约 ${a.duration_min} 分钟）` : ""}<br>${a.reason || ""}`;
     al.appendChild(el);
   });
   if (!(dec.actions || []).length) {
     al.innerHTML = `<div class="empty">当前无执行指令（系统保持观察）</div>`;
   }
 
-  // 执行器
-  const act = s.actuator || {};
-  renderValve(act.drip_valve || {});
-  renderBoom(act.spray_boom || {});
+  // 执行器：按区域分别展示（一个摄像头 = 一个区域）
   if (s.events && s.events.length) {
     const ev = s.events[s.events.length - 1];
     const dev = ev.device === "drip_valve" ? "滴灌阀门" : "喷杆喷头";
-    $("eventLog").textContent = `最近事件：${dev} ${ev.operation} · ${ev.reason || ""} @ ${(ev.ts || "").slice(11,19)}`;
+    const zname = zoneLabelOf(ev.zone);
+    $("eventLog").textContent =
+      `最近事件：${zname ? zname + " · " : ""}${dev} ${ev.operation} · ${ev.reason || ""} @ ${(ev.ts || "").slice(11,19)}`;
   }
+}
+
+// 区域 id → 展示名（事件日志用）
+function zoneLabelOf(zid) {
+  if (!zid) return "";
+  const z = (lastZones || []).find(x => x.zone_id === zid);
+  return z ? (z.zone_name || z.zone_id) : zid;
 }
 
 function renderValve(v) {
@@ -581,8 +709,16 @@ function renderBoom(b) {
   $("boomGroup").classList.toggle("boom-swing", on);
 }
 
-// ---- 持续录像帧：仅刷新摄像头网格与状态条（决策/传感器/执行器保留最近一次完整快照）----
+// ---- 持续录像帧：刷新摄像头网格与状态条；分区执行器随之实时刷新 ----
 function renderFrame(s) {
+  // 每 0.5s 带来各区域执行器状态：先更新缓存，再画卡片徽标与分区列表
+  if (s.zone_actuators) {
+    Object.keys(s.zone_actuators).forEach(z => { zoneActState[z] = s.zone_actuators[z]; });
+    (lastZones || []).forEach(z => {
+      if (s.zone_actuators[z.zone_id]) z.actuator = s.zone_actuators[z.zone_id];
+    });
+    if (lastZones.length) renderZoneList(lastZones);
+  }
   renderCams(s.cams || []);
   if (s.running !== undefined) {
     const pill = $("agentPill");
