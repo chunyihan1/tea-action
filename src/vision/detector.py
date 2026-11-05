@@ -32,6 +32,24 @@ CLASS_NAMES = [
     "Tea Mosquito bug", "Healthy", "White spot", "disease",
 ]
 
+# 权重内实际类别名（figshare 原始命名）→ 系统内部统一短名。
+# 训练产出的 tea_yolo.pt 的 names 是 "Black rot of tea" / "Tea leaf" 等长名，
+# 若不归一化，健康叶 "Tea leaf" 会被下游当成病害，导致误判与误喷药。
+_NAME_ALIASES = {
+    "Black rot of tea": "Black rot",
+    "Brown blight of tea": "Brown blight",
+    "Leaf rust of tea": "Leaf rust",
+    "Red Spider infested tea leaf": "Red Spider",
+    "Tea Mosquito bug infested leaf": "Tea Mosquito bug",
+    "Tea leaf": "Healthy",
+    "White spot of tea": "White spot",
+}
+
+
+def canonical_class(name: str) -> str:
+    """把模型输出的类别名归一化为系统内部短名（未知类别原样返回）。"""
+    return _NAME_ALIASES.get(name, name)
+
 # 推理输入分辨率：默认 320 以降低轻薄本 CPU 负载（首次调用含 torch 预热约数秒，
 # 稳态推理约 50ms/帧，几乎不影响帧率）；可通过环境变量 DETECT_IMGSZ 调整（如 480/640）。
 DETECT_IMGSZ = int(os.getenv("DETECT_IMGSZ", "320"))
@@ -149,25 +167,29 @@ class TeaDiseaseDetector:
         self._try_load()
         return self.ready
 
-    def detect(self, frame: np.ndarray | None = None, source_hint: str | None = None) -> dict:
+    def detect(self, frame: np.ndarray | None = None, source_hint: str | None = None,
+               imgsz: int | None = None, conf: float = 0.25) -> dict:
         """对一帧图像做病害检测，返回统一结构。
 
-        source_hint：帧的实际来源（"usb_cam" / "demo_frame"），由调用方（Agent 主循环）
-        根据摄像头是否读到有效画面传入，用于在页面上区分「摄像头实拍」与「演示帧」。
+        source_hint：帧的实际来源（"usb_cam" / "demo_frame" / "upload"），由调用方
+        根据画面实际来源传入，用于在页面上区分「摄像头实拍」与「上传照片」。
+        imgsz/conf：单张上传照片等静态高精度场景可传更大分辨率/更低阈值；
+        不传时沿用环境变量 DETECT_IMGSZ 与默认 0.25（摄像头实时链路保持不变）。
         模型不可用时降级为模拟检测。
         """
         if frame is None:
             frame = make_demo_frame()
         if self.model is not None:
             try:
-                return self._detect_real(frame, source_hint)
+                return self._detect_real(frame, source_hint, imgsz, conf)
             except Exception:  # noqa: BLE001 - 推理异常降级
                 pass
         return self._sim.detect(frame)
 
-    def _detect_real(self, frame: np.ndarray, source_hint: str | None = None) -> dict:
-        results = self.model.predict(frame, conf=0.25, iou=0.5, verbose=False,
-                                     imgsz=DETECT_IMGSZ)
+    def _detect_real(self, frame: np.ndarray, source_hint: str | None = None,
+                     imgsz: int | None = None, conf: float = 0.25) -> dict:
+        results = self.model.predict(frame, conf=conf, iou=0.5, verbose=False,
+                                     imgsz=imgsz or DETECT_IMGSZ)
         detections = []
         names = self.model.names if hasattr(self.model, "names") else CLASS_NAMES
         r = results[0]
@@ -177,7 +199,7 @@ class TeaDiseaseDetector:
                 conf = round(float(box.conf[0].item()), 2)
                 x1, y1, x2, y2 = [round(float(v), 1) for v in box.xyxy[0].tolist()]
                 detections.append({
-                    "class": names.get(cls_id, f"class_{cls_id}"),
+                    "class": canonical_class(names.get(cls_id, f"class_{cls_id}")),
                     "conf": conf,
                     "bbox": [x1, y1, x2, y2],
                 })

@@ -5,11 +5,11 @@
   合成茶园演示帧 → 模拟检测器生成确定性病害框
 """
 from .capture import CameraCapture, CameraManager, make_demo_frame, camera, camera_manager
-from .detector import CLASS_NAMES, TeaDiseaseDetector, SimDetector, detector
+from .detector import CLASS_NAMES, TeaDiseaseDetector, SimDetector, detector, canonical_class
 from .annotate import draw_detections, frame_to_base64
 
 __all__ = [
     "CameraCapture", "CameraManager", "make_demo_frame", "camera", "camera_manager",
-    "CLASS_NAMES", "TeaDiseaseDetector", "SimDetector", "detector",
+    "CLASS_NAMES", "TeaDiseaseDetector", "SimDetector", "detector", "canonical_class",
     "draw_detections", "frame_to_base64",
 ]
