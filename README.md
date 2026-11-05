@@ -372,6 +372,10 @@ REST API：`GET /api/status`、`GET /api/frame`（最近一帧画面）、`GET /
 
 > ✅ **本机已训练完成**（2026-10）：`data/models/tea_yolo.pt`（快速档，23 轮，验证集 mAP50=0.818）。
 > 推理环境需含 torch + ultralytics + opencv（conda 或 venv 皆可，见下「运行环境说明」）；缺少时自动降级为模拟检测。
+>
+> 📦 **训练产物已归档**：`training/runs/`（含 best/last 权重、PR 曲线、混淆矩阵、验证图，约 17MB）不再入库，
+> 见 [Releases](https://github.com/chunyihan1/tea-action/releases) 中的 `tea_yolo_training_runs.zip`；
+> 仓库只保留部署用的 `data/models/tea_yolo.pt`。重训后本地 `training/runs/` 已被 `.gitignore` 忽略。
 
 ### 运行环境说明
 
