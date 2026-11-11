@@ -21,6 +21,7 @@ import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 
@@ -49,6 +50,41 @@ _NAME_ALIASES = {
 def canonical_class(name: str) -> str:
     """把模型输出的类别名归一化为系统内部短名（未知类别原样返回）。"""
     return _NAME_ALIASES.get(name, name)
+
+
+def _iou(a: list[float], b: list[float]) -> float:
+    """两个 [x1, y1, x2, y2] 框的 IoU。"""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _nms(detections: list[dict], iou_thr: float = 0.5) -> list[dict]:
+    """按类别做非极大值抑制（切片推理后合并相邻块的重复框）。"""
+    kept: list[dict] = []
+    for cls in {d["class"] for d in detections}:
+        group = sorted((d for d in detections if d["class"] == cls), key=lambda d: -d["conf"])
+        while group:
+            best = group.pop(0)
+            kept.append(best)
+            group = [g for g in group if _iou(best["bbox"], g["bbox"]) <= iou_thr]
+    return sorted(kept, key=lambda d: -d["conf"])
+
+
+def _axis_starts(total: int, size: int, stride: int) -> list[int]:
+    """某个方向上的切片起点，保证最后一块贴住边缘。"""
+    if total <= size:
+        return [0]
+    starts = list(range(0, total - size + 1, stride))
+    if starts[-1] != total - size:
+        starts.append(total - size)
+    return starts
+
 
 # 推理输入分辨率：默认 320 以降低轻薄本 CPU 负载（首次调用含 torch 预热约数秒，
 # 稳态推理约 50ms/帧，几乎不影响帧率）；可通过环境变量 DETECT_IMGSZ 调整（如 480/640）。
@@ -206,6 +242,57 @@ class TeaDiseaseDetector:
         source = source_hint or "usb_cam"
         return build_detection_result(detections, source=source, backend="ultralytics",
                                       model=self.model_path, frame=frame)
+
+    def detect_upload(self, frame: np.ndarray, imgsz: int = 640, conf: float = 0.25,
+                      tta: bool = False, tiled: bool = False) -> dict:
+        """上传照片专用推理：支持 TTA 与切片检测，直接返回原图坐标下的结果。
+
+        tta：推理时同时做翻转/缩放并融合，通常 +1~2 点 mAP，耗时约 3 倍。
+        tiled：把大图切成带重叠的小块分别检测再合并，显著提升小病斑召回，
+               耗时随切片数线性增长；图片本身小于切片尺寸时自动退化为单次推理。
+        """
+        if self.model is None:
+            raise RuntimeError("模型未加载")
+
+        h, w = frame.shape[:2]
+        size = max(320, int(imgsz))
+        stride = max(1, int(size * 0.8))  # 20% 重叠
+
+        if tiled and (h > size or w > size):
+            tiles, offsets = [], []
+            for y0 in _axis_starts(h, size, stride):
+                for x0 in _axis_starts(w, size, stride):
+                    tiles.append(np.ascontiguousarray(frame[y0:y0 + size, x0:x0 + size]))
+                    offsets.append((x0, y0))
+        else:
+            tiles, offsets = [frame], [(0, 0)]
+
+        results = self.model.predict(tiles, conf=conf, iou=0.5, imgsz=imgsz,
+                                     augment=tta, verbose=False)
+        names = self.model.names if hasattr(self.model, "names") else CLASS_NAMES
+        detections = []
+        for r, (x0, y0) in zip(results, offsets):
+            if r.boxes is None or not len(r.boxes):
+                continue
+            for box in r.boxes:
+                cls_id = int(box.cls[0].item())
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                detections.append({
+                    "class": canonical_class(names.get(cls_id, f"class_{cls_id}")),
+                    "conf": round(float(box.conf[0].item()), 2),
+                    # 切片坐标 → 原图坐标，并裁到图像范围内
+                    "bbox": [round(max(0.0, min(w, x1 + x0)), 1),
+                             round(max(0.0, min(h, y1 + y0)), 1),
+                             round(max(0.0, min(w, x2 + x0)), 1),
+                             round(max(0.0, min(h, y2 + y0)), 1)],
+                })
+
+        if len(tiles) > 1:
+            detections = _nms(detections, iou_thr=0.5)
+
+        return build_detection_result(detections, source="upload", backend="ultralytics",
+                                      model=Path(self.model_path).name, frame=frame)
+
 
 
 # 模块级单例

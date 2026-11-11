@@ -45,8 +45,9 @@ DATASETS = BASE / "training" / "datasets" / "tea_leaf_disease"
 MODEL_OUT = BASE / "data" / "models" / "tea_yolo.pt"
 RUNS = BASE / "training" / "runs"
 
-QUICK = dict(subset=400, imgsz=320, epochs=25, batch=8, workers=2)
-FULL = dict(subset=None, imgsz=640, epochs=100, batch=16, workers=4)
+QUICK = dict(model="yolov8n.pt", subset=400, imgsz=320, epochs=25, batch=8, workers=2)
+# 完整档默认用 yolov8s（约为 n 档 3.5 倍参数），精度明显更高；显存不足把 batch 降到 8/4。
+FULL = dict(model="yolov8s.pt", subset=None, imgsz=640, epochs=100, batch=8, workers=4)
 
 SEED = 42
 
@@ -422,9 +423,9 @@ def train(cfg: dict) -> Path:
         print(f"        {k} = {v}")
     print(f"        设备 = {device}，随机种子 = {SEED}")
 
-    # 节6：创建模型（首次运行自动下载 yolov8n 预训练权重，需网络）
-    print("\n[6/11] 创建 YOLOv8n 模型（首次运行会下载预训练权重）...")
-    model = YOLO("yolov8n.pt")
+    # 节6：创建模型（首次运行自动下载预训练权重，需网络）
+    print(f"\n[6/11] 创建 {cfg['model']} 模型（首次运行会下载预训练权重）...")
+    model = YOLO(cfg["model"])
     print(f"        模型：{model.task} / 参数规模：{sum(p.numel() for p in model.model.parameters()):,}")
 
     # 节7：开始训练
@@ -476,6 +477,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="YOLOv8 茶叶病害检测训练")
     parser.add_argument("--quick", action="store_true", help="快速档（默认）")
     parser.add_argument("--full", action="store_true", help="完整档（全量数据，耗时数小时）")
+    parser.add_argument("--model", default=None,
+                        help="覆盖模型规模，如 yolov8n.pt / yolov8s.pt / yolov8m.pt")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -483,7 +486,9 @@ def main() -> None:
     print("=" * 60)
 
     check_deps()
-    cfg = FULL if args.full else QUICK
+    cfg = dict(FULL if args.full else QUICK)
+    if args.model:
+        cfg["model"] = args.model
     out = train(cfg)
 
     print()
