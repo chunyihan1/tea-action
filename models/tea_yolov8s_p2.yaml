@@ -1,0 +1,79 @@
+# 茶园病虫害检测：YOLOv8s + P2 小目标检测头（方法改进基线）
+#
+# 相对基线的改动（只改一处，便于消融归因）：
+#   基线 yolov8s.yaml 的 Detect 只接 P3/8、P4/16、P5/32 三个尺度；
+#   本配置增加 P2/4（stride=4，80×80 @640）检测层，并在 head 中补一条
+#   P2 -> P3 的下采样回融路径，使 4 个尺度（P2/P3/P4/P5）都参与预测。
+#   动机：茶树叶部病斑在 640 输入下多为十几个像素，经过 stride=8 的 P3 特征图
+#   已不足一个格子，正样本极易丢失；stride=4 的 P2 特征图能把小病斑落到 2~3 个格子上。
+#   代价：P2 特征图面积是 P3 的 4 倍，显存占用与推理耗时明显上升（见下方实测数字），
+#         训练 batch 需要相应下调，端侧部署前应评估是否值得。
+#
+# 实测（本机 ultralytics 8.4.202 / torch 2.10.0，imgsz=640，随机张量前向）：
+#   params  = 10639056 (10.64 M) ｜ GFLOPs = 36.97 ｜ 160 层 ｜ stride = [4, 8, 16, 32]
+#   基线（yolov8s.yaml 同 nc=8）：params 11138696 (11.14 M) ｜ GFLOPs = 28.66
+#   对比：GFLOPs +29%，层数 129 -> 160；参数量反而 -0.50 M（-4.5%）
+#   forward: 输入 (1, 3, 640, 640) 前向成功，输出 4 个尺度（P2/P3/P4/P5）的预测
+#
+# 参数量为什么会下降（写论文时不要写成"参数增加"，这是事实性错误）：
+#   ultralytics 的 Detect 头用 c3 = max(ch[0], min(nc, 100)) 决定分类分支宽度，
+#   ch[0] 是最细尺度特征图的通道数。基线最细是 P3（128 通道）-> c3=128；
+#   本配置最细是 P2，而 P2 分支 C2f[128] 经 width=0.5 只剩 64 通道 -> c3=64，
+#   分类分支整体变窄，抵消了"多一个检测尺度"带来的参数。上游自带
+#   yolov8-p2.yaml 在 nc=80 下同样是 10.88 M < 11.17 M，属该实现的固有行为。
+#   因此本配置的真实代价在**计算量与显存/耗时**（GFLOPs +29%、P2 特征图面积是 P3 的 4 倍），
+#   而不是参数量；论文的复杂度对比表必须用 GFLOPs 与实测延迟说话。
+#
+# 类别顺序与项目一致（src/vision/detector.py、data/models/tea_yolo.pt 的 names 顺序）：
+#   0 Black rot of tea / 1 Brown blight of tea / 2 Leaf rust of tea /
+#   3 Red Spider infested tea leaf / 4 Tea Mosquito bug infested leaf /
+#   5 Tea leaf / 6 White spot of tea / 7 disease
+#
+# 只保留 scale = s：论文的改进点需要与 yolov8s 基线逐项对比，n/m 尺度不参与本实验；
+# 若要做尺度消融，在此补 n/m 行即可（结构相同，仅 depth/width/max_channels 不同）。
+#
+# 来源：结构改写自 ultralytics 官方 cfg/models/v8/yolov8-p2.yaml（AGPL-3.0）。
+
+nc: 8 # 类别数，与项目一致
+scales: # [depth, width, max_channels]
+  s: [0.33, 0.50, 1024]
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 3, C2f, [128, True]] # 2
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 6, C2f, [256, True]] # 4
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 6, C2f, [512, True]] # 6
+  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
+  - [-1, 3, C2f, [1024, True]] # 8
+  - [-1, 1, SPPF, [1024, 5]] # 9
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 10
+  - [[-1, 6], 1, Concat, [1]] # 11 cat backbone P4
+  - [-1, 3, C2f, [512]] # 12
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 13
+  - [[-1, 4], 1, Concat, [1]] # 14 cat backbone P3
+  - [-1, 3, C2f, [256]] # 15 (P3/8-small)
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 16
+  - [[-1, 2], 1, Concat, [1]] # 17 cat backbone P2
+  - [-1, 3, C2f, [128]] # 18 (P2/4-xsmall，新增尺度)
+
+  - [-1, 1, Conv, [128, 3, 2]] # 19 P2 -> P3 下采样
+  - [[-1, 15], 1, Concat, [1]] # 20 cat head P3
+  - [-1, 3, C2f, [256]] # 21 (P3/8-small)
+
+  - [-1, 1, Conv, [256, 3, 2]] # 22 P3 -> P4 下采样
+  - [[-1, 12], 1, Concat, [1]] # 23 cat head P4
+  - [-1, 3, C2f, [512]] # 24 (P4/16-medium)
+
+  - [-1, 1, Conv, [512, 3, 2]] # 25 P4 -> P5 下采样
+  - [[-1, 9], 1, Concat, [1]] # 26 cat head P5
+  - [-1, 3, C2f, [1024]] # 27 (P5/32-large)
+
+  - [[18, 21, 24, 27], 1, Detect, [nc]] # 28 Detect(P2, P3, P4, P5)

@@ -10,10 +10,18 @@ training/research/
   audit_dataset.py   数据质量与近重复泄漏审计（dHash 或 pHash-64，分桶近邻搜索）
   benchmark.py       多模型横向对比（产出表 1 原始 csv）
   make_tables.py     csv -> paper_table.md/.tex / 消融表 / 多种子 mean±std 表
-  stats_eval.py      bootstrap 95% CI + McNemar 配对显著性检验
+  stats_eval.py      bootstrap 95% CI + McNemar 配对检验 + 多重比较 Holm 校正
   error_analysis.py  FP/FN 裁剪图导出 + 按类别/尺寸/置信度统计
   seed_study.py      多种子重复实验（train+val，输出 mean±std）
+  domain_eval.py     跨域评估：多域 P/R/F1 + 95% CI + 相对 in-domain 的下降幅度
+  make_splits.py     按组（茶园/批次）切分 train/val/test，输出可复查的 txt/json
   README.md          本文件
+```
+
+模型配置在仓库根目录的 `models/` 下（不改 `src/`）：
+
+```
+models/tea_yolov8s_p2.yaml   YOLOv8s + P2（stride=4）小目标检测头
 ```
 
 依赖仅用到项目已有环境：Python 3.11、ultralytics、Pillow、numpy、pandas、pyyaml、
@@ -99,6 +107,8 @@ python training\research\stats_eval.py --model data\models\tea_yolo.pt --data <y
 产出：`research_out\stats\per_image.csv`（每模型每图一行 TP/FP/FN）、`stats.json`、`stats.md`。
 内容：micro P/R/F1 及其 95% bootstrap CI；给两个模型时附 McNemar 2×2 配对表、
 连续性校正 χ²、p 值，以及 F1 差值的配对 bootstrap CI。
+给 **≥3 个模型**时做所有两两 McNemar，并输出原始 p 与 Holm-Bonferroni 校正后 p
+（`--model a.pt,b.pt,c.pt`，校正自实现、不依赖 scipy）；1~2 个模型时输出与旧版一致。
 口径：某图"检测正确" = 该图无 FP 且无 FN；TP 要求同类且 IoU ≥ `--iou`。
 
 ### 5. 误差分析（FP / FN 裁剪图与统计）
@@ -123,6 +133,34 @@ python training\research\seed_study.py --seeds 1,2,3,4,5 --data <yaml> --epochs 
 每个 seed 执行 `yolo detect train ... seed=S deterministic=True` 后对 `best.pt` 执行
 `yolo detect val`，解析 P/R/mAP50/mAP50-95，产出 `seeds.csv`、`seeds.md`（逐 seed + 汇总
 mean ± std 与样本量）。`--dry-run` 只打印命令（每 seed 一行，train && val），完全离线可用。
+
+### 7. 跨域评估（in-domain vs out-of-domain）
+
+```bat
+python training\research\domain_eval.py --model data\models\tea_yolo.pt ^
+    --data in=training\datasets\tea_leaf_disease\data.yaml ^
+    --data bd=data\external\tea_leaf_bd\data.yaml ^
+    --data assam=data\external\cs_d_assam\data.yaml
+```
+
+`--data` 可重复传，格式 `名称=data.yaml`，**第一个成功的域作为 in-domain 基准**。
+每个域输出图片数 / GT 数 / P / R / F1 + 95% bootstrap CI，并自动算出 F1 的绝对与相对下降，
+最后给一段“域偏移结论”。单个域缺目录、缺 data.yaml、标签全缺时只跳过该域（表里留一行
+`status=error`），不中断其他域。产出 `domain_eval.csv` / `.md` / `.json`。
+推理与匹配复用 `stats_eval.py` 的实现，保证与 `stats.md` 的口径一致。
+
+### 8. 按组切分（防数据泄漏）
+
+```bat
+python training\research\make_splits.py --images training\datasets\tea_leaf_disease\train\images ^
+    --labels training\datasets\tea_leaf_disease\train\labels --ratios 0.7,0.2,0.1 --seed 42
+```
+
+组名由 `--group-regex`（默认 `^(.*?)[_-]`，`g1_01.jpg -> g1`）从文件名提取，整组只进一个 split。
+产出 `train.txt` / `val.txt` / `test.txt`（绝对路径，可直接写进 data.yaml 的 `train:` / `val:` /
+`test:` 字段）、`split_report.md`（各 split 图片数、类别实例数、组名、四条互斥校验）、`splits.json`。
+组数 < 3 时自动降级（2 组 → 只切 train/val；1 组 → 只有 train）并在终端与报告里明确提示，
+不会静默产生空文件。`--labels` 留空则只切图、不统计类别。
 
 ---
 
@@ -372,6 +410,138 @@ python training\calibrate_conf.py --model data\models\tea_yolo.pt --imgsz 640
 | 4 | **单次结果无方差**，"优于"不成立 | `seed_study.py` 5 seeds 的 mean±std + `stats_eval.py` bootstrap CI |
 | 5 | **无显著性检验**，差异落在噪声内 | `stats_eval.py` 的 McNemar（χ²、p、α=0.05）与 F1 差值配对 CI |
 | 6 | **误差分析缺失**，只报聚合指标 | `error_analysis.py` 的 FP/FN 裁剪图 + 按类别/尺寸/置信度统计与误判来源 |
+
+---
+
+## 七、SCI 一区（Q1）投稿要求
+
+第六节解决的是"**结果可信**"（划分、泄漏、CI、显著性）；一区还要求"**方法有新意 + 泛化被证明 +
+证据链完整**"。以下按审稿人实际会追问的顺序列出，逐条可核对。
+
+### 7.1 创新点必须能一句话讲清，且可验证
+
+一区不会接受"把 YOLOv8s 换成 YOLOv8m / 换数据集 / 调超参"。创新点必须写成
+"针对 X 问题，做 Y 改动，在 Z 指标上带来可复现收益"，并配消融与显著性。三个候选方向：
+
+| 方向 | 具体做法 | 预期收益 | 验证方法 | 风险 |
+| --- | --- | --- | --- | --- |
+| **A. P2 小目标检测头** | `models/tea_yolov8s_p2.yaml`：在 P3/P4/P5 之外增加 P2（stride=4）检测层与 P2→P3 回融 | 小病斑在 640 输入下不被 stride=8 抹掉，AP_small / 小目标召回提升 | 同划分同 imgsz 与 yolov8s 对比；`error_analysis.py` 按尺寸分箱看 FN；只改配置文件即为天然消融 | 收益常只有 1~2 个点，易落在 seed 方差内；实测 10.64 M / 37.0 GFLOPs vs 基线 11.14 M / 28.7 GFLOPs——**参数没涨、算力 +29%**，正文不能写"参数增加" |
+| **B. 切片推理 + 置信度标定** | 大图切块推理再融合（SAHI 式）；在独立标定集上扫 conf 取 F1 最优点，报 ECE/Brier | 高分辨率原图整幅缩放会糊掉小病斑，切片提升召回；标定压低"低置信度误报" | 切片开/关消融（同权重）；`calibrate_conf.py` 出 P/R/F1–conf 曲线；报单图延迟随切片数的增长 | 切片边界目标重复计数、延迟×N；标定集与测试集混用会被视为调参泄漏 |
+| **C. 跨域自适应 / 伪标签** | 源域模型在无标注外部域生成伪标签，置信度阈值 + 人工抽检后自训练（`pseudo_label.py` 有基础） | 缩小外部域 ΔF1，证明"可落地"而不只是实验室指标 | `domain_eval.py` 报自适应前后各域 F1 与 ΔF1，配合 Holm 校正显著性 | 确认偏误会被放大；必须严格区分"外部域无监督适应"与"外部域参与有监督训练"，后者等于作弊 |
+
+选一个方向**做深**（消融齐全、显著性成立），比三个都浅尝更容易过一区。
+
+### 7.2 对比方法清单（≥5 个，同划分同分辨率）
+
+| 方法 | 家族 | 说明 |
+| --- | --- | --- |
+| YOLOv8n | YOLOv8 | 轻量基线，`benchmark.py` 默认已含 |
+| YOLOv8s | YOLOv8 | **主基线**，改进相对它报告 |
+| YOLOv8m | YOLOv8 | 同门更大尺度，证明不是靠堆参数 |
+| YOLO11n | YOLO11 | 新一代官方基线 |
+| YOLO11s | YOLO11 | 与主基线同量级 |
+| RT-DETR（或 YOLOv10n/s） | DETR / 无 NMS | 换范式对照，避免"只和 YOLO 比"的批评 |
+
+硬性要求：
+
+- 全部**同一 data.yaml、同一 split 文件、同一 imgsz=640、同一 conf/iou、同一硬件**；
+- 表格必须分两列：`reproduced (本机复现)` 与 `reported (文献原文)`，
+  reported 每格标注引用编号 `[3]`，并在参考文献给出数据集/划分/分辨率；
+  **reported 与 reproduced 混在一列 = 审稿人直接质疑数据真实性**；
+- 命令：`python training\research\benchmark.py --models yolov8n.pt,yolov8s.pt,yolov8m.pt,yolo11n.pt,yolo11s.pt`。
+
+### 7.3 数据要求：in-domain + ≥2 个外部域
+
+| 角色 | 数据集 | 用途 |
+| --- | --- | --- |
+| in-domain | figshare Tea Leaf Disease v1.0（8 类，本项目主数据） | 训练 + 同分布验证/测试 |
+| 外部域 1 | 孟加拉 **TeaLeafDiseaseBD** | **只测不训**，报域偏移 |
+| 外部域 2 | 印度 **CS-D Assam** | **只测不训**，报域偏移 |
+
+- 外部域**不得**参与训练、early stopping、阈值选择、模型选择中的任何一步；
+  正文用一句话交代："外部域仅用于最终评估"。
+- 外部域类别体系不同时，附录给类别映射表，无法映射的类别剔除并说明，不要强行合并。
+- 用 `domain_eval.py` 一次报出各域 P/R/F1 + 95% CI + 相对 in-domain 的绝对/相对下降，
+  并在正文把 ΔF1 作为泛化性的核心证据（这是 Q1 最常被要求补的实验）。
+
+### 7.4 统计要求
+
+| 项 | 最低要求 | 工具 |
+| --- | --- | --- |
+| 重复实验 | **≥5 seeds**，mean ± std（ddof=1），正文写 n=5 | `seed_study.py` → `seeds.md` |
+| 置信区间 | bootstrap **≥1000** 次，报 95% CI | `stats_eval.py`、`domain_eval.py` |
+| 显著性 | 两两 McNemar + **Holm-Bonferroni 校正**，α=0.05，报校正后 p | `stats_eval.py --model a.pt,b.pt,c.pt` |
+| 多域/多指标 | 同一批比较必须校正；只挑显著结果汇报视为选择性报告 | 同上 |
+
+正文写法示例：`F1 = 0.812 [0.789, 0.834]`、`0.740 ± 0.006 (n=5)`、
+`McNemar χ²=4.17, df=1, p_raw=0.041, p_Holm=0.082（α=0.05，不显著）`。
+
+### 7.5 效率与部署要求
+
+| 指标 | 获取方式 | 必须注明 |
+| --- | --- | --- |
+| 参数量 | `benchmark.py` 的 `params` 列 | 类别数 nc（改 nc 会改检测头宽度，跨论文比较要说明） |
+| GFLOPs | `benchmark.py` 的 `gflops` 列 | 输入分辨率 |
+| GPU 单图延迟 | `benchmark.py --latency-image <图>`（warmup 3 + 计时 20 取中位数） | GPU 型号、驱动、CUDA/cuDNN、torch 版本 |
+| 吞吐（img/s） | 固定 batch 的 `batch / 平均单批耗时` | batch、精度（FP32/FP16） |
+| CPU 单图延迟 | 同上加 `--device cpu` | CPU 型号、线程数 |
+| ONNX 导出后延迟 | `model.export(format="onnx")` 后用 onnxruntime 计时 | opset、是否 FP16、provider（CPU/CUDA） |
+
+不同硬件上的延迟不可比；缺任一环境信息，效率表就会被要求重做。
+`models/tea_yolov8s_p2.yaml` 的 P2 分支会显著抬高显存与耗时，必须在效率表中体现这一代价。
+
+### 7.6 可复现与开放科学
+
+- 训练固定 `seed` 且 `deterministic=True`，归档每个 run 的 `args.yaml`；
+- 记录 Python / torch / ultralytics / CUDA / GPU / 驱动版本（正文"实验环境"小节）；
+- **公开 split 文件**：`make_splits.py` 产出的 `train.txt` / `val.txt` / `test.txt` +
+  `splits.json` 作为补充材料，审稿人可完全复现划分（这是消除"数据泄漏"质疑最有效的一步）；
+- 公开代码与权重：仓库地址 + 权重下载链接 + SHA256；许可证要写清
+  （衍生自 ultralytics 的配置/权重受 **AGPL-3.0** 约束，正文与仓库都要声明）；
+- 数据可用性声明：来源、许可证、下载日期、校验和；自采数据说明设备、时间、标注规范与标注人。
+
+### 7.7 图表清单（Q1 常见配置）
+
+| 表 | 内容 | 来源 |
+| --- | --- | --- |
+| 表 1 | 多模型对比（Params / GFLOPs / P / R / mAP / 延迟），含 reported 列 | `paper_table.md/.tex` |
+| 表 2 | 数据划分与类别分布（按茶园/批次分组，组数与组名） | `splits.json`、`split_report.md`、`audit.md` |
+| 表 3 | 近重复审计（泄漏率、近重复对数、示例） | `audit.md` 第 4 节 |
+| 表 4 | 跨域结果（in-domain + 外部域 + ΔF1 + 95% CI） | `domain_eval.md` |
+| 表 5 | 消融（P2 / 切片 / TTA / imgsz / 阈值，一次只改一个变量） | `paper_table_imgsz.md`、`paper_table_tta.md` + 自建表 |
+| 表 6 | 复杂度与部署（GPU/CPU/ONNX 延迟、吞吐、硬件） | `benchmark.md` + ONNX 计时脚本 |
+
+| 图 | 内容 | 说明 |
+| --- | --- | --- |
+| 图 1 | 数据集示例与类别/尺寸分布 | 每类 2~3 张典型图 + 长尾柱状图 |
+| 图 2 | 方法总体结构 | 必须画出 P2（stride=4）分支与回融路径 |
+| 图 3 | 训练曲线（loss、mAP） | `results.png`，注明早停策略 |
+| 图 4 | PR 曲线（多模型同图） | 同划分同 imgsz 才有可比性 |
+| 图 5 | 混淆矩阵（含背景行列） | 解释相似病斑混淆 |
+| 图 6 | FP / FN 典型案例 | `error_analysis.py` 导出裁剪图拼 2×3 |
+| 图 7 | 跨域性能下降 + 置信区间 | 条形图带 error bar，直接支撑"泛化性"论点 |
+
+### 7.8 "Q1 最小可投组合"（做什么就够投，缺什么会被拒）
+
+必须全部成立才谈得上送审：
+
+- [ ] **一个能一句话讲清的创新点**（7.1 的 A 或 B 选一个做深），且消融 + Holm 校正后仍显著；
+- [ ] **≥5 个对比方法**（含 1 个非 YOLO 家族），reported 与 reproduced 分列并带引用；
+- [ ] **按组划分 + 泄漏率 < 5%**，公开 `train/val/test.txt` 与 `splits.json`；
+- [ ] **in-domain + ≥2 个外部域**，报 ΔF1 与 95% CI（外部域全程不参与训练/调参）；
+- [ ] **≥5 seeds** 的 mean±std + bootstrap 95% CI + Holm 校正后的 p；
+- [ ] **效率表**：Params / GFLOPs / GPU 与 CPU 延迟 / 吞吐 / ONNX 延迟，附完整硬件环境；
+- [ ] 图 1~7、表 1~6 齐全，编号与正文引用一致；
+- [ ] 代码、权重、划分文件、环境版本公开；数据可用性声明与许可证写清。
+
+缺任一项的典型后果：无创新点 → desk reject；无外部域 → 大修后被拒；
+无显著性校正 → 结论被质疑；无公开划分 → 被怀疑数据泄漏；无效率表 → 被质疑不可部署。
+
+**结论（必须写进论文的局限段，也必须自己先承认）**：
+仅靠当前"单数据集 figshare + 无方法创新 + 单次训练结果"，即使把本目录所有工具都跑一遍，
+也**达不到一区门槛**。工具只保证"数字可信、可复现"；一区真正决定成败的是
+**方法层面的新意**（P2 / 切片+标定 / 跨域自适应必须有一个被验证有效）、
+**独立外部域上的泛化证据**，以及**写作与开源规范**——这三项都不是代码能替代的。
 
 ---
 

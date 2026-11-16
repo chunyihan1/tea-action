@@ -11,11 +11,14 @@
   - bootstrap 用 np.random.multinomial 一次抽取"每张图被抽中几次"，等价于有放回重采样，
     但内存与耗时都远小于逐次 np.random.choice（固定 seed，结果可复现）；
   - McNemar 用连续性校正 χ² = (|b-c|-1)²/(b+c)，p = erfc(sqrt(χ²/2))，不依赖 scipy；
+  - 给 ≥3 个模型时做**所有两两** McNemar，并用 Holm-Bonferroni 校正原始 p 值
+    （控制族错误率 FWER，自行实现，不依赖 scipy）；给 1~2 个模型时输出与旧版一致；
   - 单模型失败只报错不抛栈，仍有可用结果时照样落盘，最后以非 0 退出码提示。
 
 用法：
   python training\\research\\stats_eval.py --model data\\models\\tea_yolo.pt --data training\\datasets\\tea_leaf_disease\\data.yaml
   python training\\research\\stats_eval.py --model runs\\a\\best.pt,runs\\b\\best.pt --bootstrap 2000
+  python training\\research\\stats_eval.py --model a.pt,b.pt,c.pt --bootstrap 2000   :: 多重比较 + Holm 校正
   python training\\research\\stats_eval.py --model data\\models\\tea_yolo.pt --imgsz 64 --conf 0.01 --device cpu --bootstrap 50
 """
 from __future__ import annotations
@@ -38,7 +41,8 @@ from common import (class_name, get_preds, load_data_yaml, match_image,
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="bootstrap 置信区间 + McNemar 显著性检验")
     parser.add_argument("--model", required=True,
-                        help="模型权重路径，逗号分隔可给 1~2 个（2 个时做 McNemar 检验）")
+                        help="模型权重路径，逗号分隔可给多个；1 个只出 CI，"
+                             "2 个做配对 McNemar，≥3 个做两两检验 + Holm 校正")
     parser.add_argument("--data", required=True, help="data.yaml 路径")
     parser.add_argument("--split", default="val", help="评估划分，默认 val")
     parser.add_argument("--imgsz", type=int, default=640, help="推理分辨率")
@@ -202,6 +206,51 @@ def mcnemar_test(correct_a: np.ndarray, correct_b: np.ndarray) -> dict:
     }
 
 
+def holm_bonferroni(p_values: list[float]) -> list[float]:
+    """Holm-Bonferroni 校正，控制族错误率 FWER ≤ α。
+
+    做法：把 m 个原始 p 升序排列，第 k 小（k 从 1 起）的 p 乘以 (m - k + 1)，
+    再取前缀最大值（保证校正后仍单调不减），最后截断到 1。
+    不依赖 scipy，与 statsmodels 的 multipletests(method="holm") 口径一致。
+    """
+    m = len(p_values)
+    adjusted = [0.0] * m
+    running = 0.0
+    for rank, idx in enumerate(sorted(range(m), key=lambda i: p_values[i])):
+        running = max(running, min(1.0, (m - rank) * p_values[idx]))
+        adjusted[idx] = running
+    return adjusted
+
+
+def pairwise_mcnemar(models: list[dict]) -> dict:
+    """对 ≥3 个模型做所有两两 McNemar，并给出 Holm 校正后的 p 值。
+
+    models 为 status=ok 的模型结果列表（含逐图 tp/fp/fn 数组）。
+    配对单位与两模型分支一致：整图"无 FP 且无 FN"记为检测正确。
+    """
+    corrects = [(m["fp"] == 0) & (m["fn"] == 0) for m in models]
+    pairs: list[dict] = []
+    for i in range(len(models)):
+        for j in range(i + 1, len(models)):
+            mc = mcnemar_test(corrects[i], corrects[j])
+            pairs.append({
+                "model_a": models[i]["model"],
+                "model_b": models[j]["model"],
+                "mcnemar": mc,
+            })
+    adjusted = holm_bonferroni([p["mcnemar"]["p_value"] for p in pairs])
+    for pair, p_adj in zip(pairs, adjusted):
+        pair["p_holm"] = round(float(p_adj), 6)
+        pair["significant_holm"] = bool(p_adj < 0.05)
+    return {
+        "method": "Holm-Bonferroni",
+        "alpha": 0.05,
+        "n_models": len(models),
+        "n_tests": len(pairs),
+        "pairs": pairs,
+    }
+
+
 # ============================================================
 # 输出
 # ============================================================
@@ -249,6 +298,7 @@ def write_markdown(path: Path, report: dict) -> None:
     lines += ["", "表注：方括号内为 95% bootstrap 置信区间；F1 由 micro P/R 计算。", ""]
 
     comp = report.get("comparison")
+    multi = report.get("multi_comparison")
     if comp:
         lines += [
             "## 2. 配对 McNemar 检验",
@@ -272,6 +322,35 @@ def write_markdown(path: Path, report: dict) -> None:
             f"- 区间{'不包含 0，差异可认为稳定' if comp['f1_diff']['excludes_zero'] else '包含 0，差异可能只是重采样噪声'}",
             "",
         ]
+    elif multi:
+        lines += [
+            "## 2. 多重比较（所有两两 McNemar + Holm-Bonferroni 校正）",
+            "",
+            "判定口径：某张图“检测正确”= 该图无 FP 且无 FN（整图级配对，与两模型分支一致）。",
+            "",
+            f"- 模型数 {multi['n_models']}，两两检验 {multi['n_tests']} 次；"
+            f"校正方法 {multi['method']}；显著性水平 α={multi['alpha']}",
+            "- 校正方法：原始 p 升序排列，第 k 小乘以 (m−k+1) 并取前缀最大值（截断到 1），"
+            "控制族错误率 FWER ≤ 0.05；只有校正后 p < 0.05 才判为显著。",
+            "- 为什么必须校正：m 次独立检验下至少一次假阳性的概率约为 1−(1−0.05)^m，"
+            "3 个模型（3 次检验）已升至约 14%，未校正的“显著”不可采信。",
+            "",
+            "| 模型 A | 模型 B | b（A 对 B 错） | c（A 错 B 对） | χ² | 原始 p | Holm 校正 p | α=0.05 显著 |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | :---: |",
+        ]
+        for pair in multi["pairs"]:
+            mc = pair["mcnemar"]
+            lines.append(
+                f"| {pair['model_a']} | {pair['model_b']} | {mc['only_a_correct']} | "
+                f"{mc['only_b_correct']} | {mc['chi2']:.3f} | {mc['p_value']:.6f} | "
+                f"{pair['p_holm']:.6f} | {'是' if pair['significant_holm'] else '否'} |"
+            )
+        lines += [
+            "",
+            "表注：b/c 为不一致对数；χ² 已做连续性校正，df=1；"
+            "论文正文应报告 Holm 校正后的 p，并写明校正方法与 α=0.05。",
+            "",
+        ]
 
     lines += ["## 4. 结论", "", f"> {report['conclusion']}", ""]
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -286,6 +365,15 @@ def build_conclusion(report: dict) -> str:
         return (f"{m['model']} 在 {report['split']} 上 F1={m['f1']:.4f}"
                 f"（95% CI {m['ci']['f1']['ci_low']:.4f}–{m['ci']['f1']['ci_high']:.4f}）；"
                 f"置信区间宽度反映样本量，区间越窄结论越稳。")
+    if len(ok) >= 3:
+        multi = report.get("multi_comparison") or {}
+        pairs = multi.get("pairs", [])
+        sig = [p for p in pairs if p.get("significant_holm")]
+        best = max(ok, key=lambda m: m["f1"])
+        return (f"{len(ok)} 个模型、{len(pairs)} 次两两 McNemar 检验，"
+                f"Holm-Bonferroni 校正后显著的对数 {len(sig)}/{len(pairs)}（α=0.05）；"
+                f"F1 最高为 {best['model']}（F1={best['f1']:.4f}，"
+                f"95% CI {best['ci']['f1']['ci_low']:.4f}–{best['ci']['f1']['ci_high']:.4f}）。")
     comp = report.get("comparison") or {}
     a, b = ok[0], ok[1]
     mc = comp.get("mcnemar", {})
@@ -304,9 +392,6 @@ def main() -> None:
     models = [x.strip() for x in args.model.replace("，", ",").split(",") if x.strip()]
     if not models:
         print("[错误] --model 至少需要一个权重路径")
-        sys.exit(1)
-    if len(models) > 2:
-        print(f"[错误] 最多支持 2 个模型做配对检验，当前给 {len(models)} 个")
         sys.exit(1)
     if args.bootstrap < 1:
         print("[错误] --bootstrap 必须 ≥ 1")
@@ -358,6 +443,7 @@ def main() -> None:
         "class_names": names,
         "models": [],
         "comparison": None,
+        "multi_comparison": None,
     }
 
     boot_cis: list[dict] = []
@@ -409,6 +495,18 @@ def main() -> None:
         }
     elif len(ok) == 1 and len(results) == 2:
         report["comparison"] = None
+
+    # ≥3 模型：所有两两 McNemar + Holm-Bonferroni 校正（控制 FWER）
+    if len(ok) >= 3:
+        multi = pairwise_mcnemar(ok)
+        report["multi_comparison"] = multi
+        print(f"\n[统计] {multi['n_models']} 个模型，{multi['n_tests']} 次两两 McNemar，"
+              f"Holm 校正后显著 {sum(p['significant_holm'] for p in multi['pairs'])} 对"
+              f"（α={multi['alpha']}）")
+        for pair in multi["pairs"]:
+            print(f"  {pair['model_a']} vs {pair['model_b']}："
+                  f"p={pair['mcnemar']['p_value']:.6f} -> Holm p={pair['p_holm']:.6f}"
+                  f"（{'显著' if pair['significant_holm'] else '不显著'}）")
 
     report["conclusion"] = build_conclusion(report)
 
