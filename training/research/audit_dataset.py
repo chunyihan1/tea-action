@@ -1,4 +1,4 @@
-"""数据集质量与泄漏审计：dHash 近重复检测 + 划分/标注统计。
+"""数据集质量与泄漏审计：dHash / pHash 近重复检测 + 划分/标注统计。
 
 为什么需要：
   训练集与验证集若存在近重复（同一张图轻微裁剪/调色/缩放），验证集指标会虚高。
@@ -7,6 +7,8 @@
 实现要点：
   - 自己用 Pillow + numpy 实现 64 位 dHash（缩放到 9x8 灰度，比较水平相邻像素），
     不依赖 imagehash，避免新增依赖；
+  - pHash 用 cv2.dct（32x32 灰度 -> DCT -> 左上 8x8 低频 -> 与中位数比较），
+    对亮度/对比度/轻微几何变换更稳健；cv2 不可用时给出提示并自动回退 dHash；
   - 近重复搜索不做 O(n²)：把 64 位哈希从高位切成 threshold+1 段做精确分桶。
     依据鸽巢原理：若两张图 Hamming 距离 ≤ threshold，则至少有一段完全相同，
     因此分桶不会漏检，平均只需比较极少量候选；
@@ -15,7 +17,7 @@
 用法：
   python training\\research\\audit_dataset.py
   python training\\research\\audit_dataset.py --data-root training\\datasets\\tea_leaf_disease --out research_out
-  python training\\research\\audit_dataset.py --hash-threshold 6
+  python training\\research\\audit_dataset.py --hash phash --hash-threshold 6
 """
 from __future__ import annotations
 
@@ -119,20 +121,52 @@ def load_class_names(root: Path) -> tuple[list[str], Path | None]:
 
 
 # ============================================================
-# 图像扫描：一次打开同时取 dHash 与宽高
+# 图像扫描：一次打开同时取哈希与宽高
 # ============================================================
-def image_hash_and_size(path: Path, hash_size: int = 8) -> tuple[int, int, int]:
-    """返回 (64 bit dHash, 宽, 高)。
+def phash_supported() -> bool:
+    """pHash 依赖 cv2.dct，用于探测环境是否能走 pHash 分支。"""
+    try:
+        import cv2  # noqa: F401
 
-    dHash：灰度化 -> 缩放到 (hash_size+1) x hash_size -> 每行比较相邻像素，
-    得到 8x8=64 个 bit，再按大端打包成 Python int。
+        return True
+    except ImportError:
+        return False
+
+
+def _dhash(gray: Image.Image, hash_size: int) -> int:
+    """dHash：9x8 灰度，比较每行相邻像素，得到 64 bit。"""
+    arr = np.asarray(gray.resize((hash_size + 1, hash_size), RESAMPLE), dtype=np.int16)
+    bits = (arr[:, 1:] > arr[:, :-1]).ravel()
+    return int.from_bytes(np.packbits(bits).tobytes(), "big")
+
+
+def _phash(image: Image.Image, hash_size: int, highfreq_factor: int = 4) -> int:
+    """pHash：32x32 灰度 -> 二维 DCT -> 左上 8x8 低频 -> 与中位数比较。
+
+    中位数取除直流分量（DCT 系数 [0,0]，代表整体亮度）之外的 63 个系数，
+    否则直流项会把中位数抬高，几乎所有 bit 都变成 0，哈希就失去区分度。
     """
+    import cv2
+
+    size = hash_size * highfreq_factor  # 8 * 4 = 32
+    arr = np.asarray(image.resize((size, size), RESAMPLE), dtype=np.float32)
+    dct = cv2.dct(arr)
+    low = np.asarray(dct[:hash_size, :hash_size], dtype=np.float32)
+    median = float(np.median(low.flatten()[1:]))
+    bits = (low > median).ravel()
+    return int.from_bytes(np.packbits(bits).tobytes(), "big")
+
+
+def image_hash_and_size(path: Path, hash_size: int = 8,
+                        method: str = "dhash") -> tuple[int, int, int]:
+    """返回 (64 bit 哈希, 宽, 高)。method 取 dhash 或 phash。"""
     with Image.open(path) as im:
         width, height = im.size
-        gray = im.convert("L").resize((hash_size + 1, hash_size), RESAMPLE)
-    arr = np.asarray(gray, dtype=np.int16)
-    bits = (arr[:, 1:] > arr[:, :-1]).ravel()
-    digest = int.from_bytes(np.packbits(bits).tobytes(), "big")
+        gray = im.convert("L")
+        if method == "phash":
+            digest = _phash(gray, hash_size)
+        else:
+            digest = _dhash(gray, hash_size)
     return digest, width, height
 
 
@@ -174,7 +208,8 @@ def read_label_file(path: Path, nc: int) -> tuple[dict[int, int], int, int]:
     return per_class, valid, invalid
 
 
-def scan_split(root: Path, split: str, nc: int, hash_size: int = 8) -> dict:
+def scan_split(root: Path, split: str, nc: int, hash_size: int = 8,
+               hash_method: str = "dhash") -> dict:
     """扫描一个 split：图片数、标签、类别实例、尺寸、哈希。"""
     dirs = resolve_split_dirs(root, split)
     if dirs is None:
@@ -198,7 +233,7 @@ def scan_split(root: Path, split: str, nc: int, hash_size: int = 8) -> dict:
 
     for i, img in enumerate(images):
         try:
-            digest, w, h = image_hash_and_size(img, hash_size)
+            digest, w, h = image_hash_and_size(img, hash_size, hash_method)
         except Exception as e:  # noqa: BLE001 - 损坏图片不应中断审计
             print(f"  [警告] 无法读取图像 {img.name}：{e}")
             digest, w, h = 0, 0, 0
@@ -352,7 +387,7 @@ def build_markdown(audit: dict, class_names: list[str]) -> str:
         "",
         f"- 数据根目录：`{audit['data_root']}`",
         f"- data.yaml：`{audit['data_yaml'] or '未找到'}`",
-        f"- 哈希方法：dHash-64；近重复阈值：Hamming ≤ {audit['hash_threshold']}",
+        f"- 哈希方法：{audit['hash_method']}；近重复阈值：Hamming ≤ {audit['hash_threshold']}",
         f"- 生成时间：{ts}",
         "",
     ]
@@ -439,9 +474,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="数据集质量与近重复泄漏审计")
     parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT),
                         help="数据集根目录（含 train/valid/test）")
+    parser.add_argument("--hash", choices=("dhash", "phash"), default="dhash",
+                        help="近重复哈希算法，默认 dhash；phash 需要 opencv(cv2)")
     parser.add_argument("--out", default="research_out", help="输出目录")
     parser.add_argument("--hash-threshold", type=int, default=8,
-                        help="dHash Hamming 距离阈值，默认 8（0~64）")
+                        help="哈希 Hamming 距离阈值，默认 8（0~64，dHash/pHash 通用）")
     args = parser.parse_args()
 
     root = Path(args.data_root)
@@ -452,21 +489,29 @@ def main() -> None:
     if not 0 <= args.hash_threshold <= 64:
         print("[错误] --hash-threshold 必须在 0~64 之间")
         sys.exit(1)
+    if args.hash == "phash" and not phash_supported():
+        print("[警告] 未检测到 opencv(cv2)，pHash 不可用，已自动回退到 dHash")
+        print("       如需 pHash：pip install opencv-python（本仓库环境通常已预装）")
+        args.hash = "dhash"
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    hash_method = ("pHash-64 (32x32 DCT, low-freq 8x8, vs median)"
+                   if args.hash == "phash"
+                   else "dHash-64 (9x8 grayscale, horizontal adjacent compare)")
+
     class_names, yaml_path = load_class_names(root)
     nc = len(class_names)
     print(f"[信息] 数据根目录：{root}")
-    print(f"[信息] 类别数：{nc} ｜ 阈值：{args.hash_threshold}")
+    print(f"[信息] 哈希方法：{args.hash} ｜ 类别数：{nc} ｜ 阈值：{args.hash_threshold}")
     if not class_names:
         print("[警告] 未解析到类别名，类别将以 class_0/class_1... 显示")
 
     t_start = time.time()
     splits: dict[str, dict] = {}
     for split in SPLITS:
-        s = scan_split(root, split, nc)
+        s = scan_split(root, split, nc, hash_method=args.hash)
         if not s:
             print(f"[跳过] {split}/ 不存在")
             continue
@@ -500,14 +545,15 @@ def main() -> None:
         print("[提示] 缺少 train 或 valid，跳过近重复检测")
 
     leak = nd["train_vs_valid"]["leak_rate"]
+    hash_label = "pHash" if args.hash == "phash" else "dHash"
     if "train" in splits and "valid" in splits:
         if leak >= 0.05:
             conclusion = (f"验证集 {leak * 100:.1f}% 的图片与训练集存在近重复"
-                          f"（dHash 距离 ≤ {args.hash_threshold}），指标可能虚高；"
+                          f"（{hash_label} 距离 ≤ {args.hash_threshold}），指标可能虚高；"
                           f"建议按茶园/拍摄批次重新划分数据后再报告结果。")
         else:
             conclusion = (f"验证集仅 {leak * 100:.1f}% 的图片与训练集存在近重复"
-                          f"（dHash 距离 ≤ {args.hash_threshold}），未见明显同源泄漏。")
+                          f"（{hash_label} 距离 ≤ {args.hash_threshold}），未见明显同源泄漏。")
     else:
         conclusion = "缺少 train 或 valid 划分，无法评估近重复泄漏。"
 
@@ -515,7 +561,8 @@ def main() -> None:
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "data_root": str(root),
         "data_yaml": str(yaml_path) if yaml_path else None,
-        "hash_method": "dHash-64 (9x8 grayscale, horizontal adjacent compare)",
+        "hash_method": hash_method,
+        "hash_type": args.hash,
         "hash_threshold": args.hash_threshold,
         "class_names": class_names,
         "splits": {},

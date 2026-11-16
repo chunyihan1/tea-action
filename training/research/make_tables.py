@@ -7,6 +7,8 @@
   - paper_table.md / paper_table.tex      主表（TTA=False 的主结果）
   - paper_table_tta.md                    若 csv 同时含 augment=False/True，生成 TTA 消融表
   - paper_table_imgsz.md                  若 csv 含多个 imgsz，生成分辨率消融表
+  - paper_table_seeds.md                  若 csv 含 seed 列（或有同模型多行重复实验），
+                                          生成 mean ± std 表
 
 用法：
   python training\\research\\make_tables.py
@@ -47,9 +49,10 @@ def to_bool(value) -> bool | None:
     return None
 
 
-def load_rows(csv_path: Path) -> tuple[list[dict], list[str], int]:
-    """读取 csv，返回 (成功行, 失败模型名, 失败数)。"""
+def load_rows(csv_path: Path) -> tuple[list[dict], list[str], int, bool]:
+    """读取 csv，返回 (成功行, 失败模型名, 失败数, 是否含 seed 列)。"""
     df = pd.read_csv(csv_path, encoding="utf-8-sig")
+    has_seed = "seed" in df.columns
     rows: list[dict] = []
     failed: list[str] = []
     for _, rec in df.iterrows():
@@ -65,13 +68,16 @@ def load_rows(csv_path: Path) -> tuple[list[dict], list[str], int]:
             "model": model,
             "params": params,
             "params_m": params / 1e6 if params is not None else None,
+            "precision": to_float(rec.get("precision")),
+            "recall": to_float(rec.get("recall")),
             "map50": to_float(rec.get("map50")),
             "map5095": to_float(rec.get("map50_95")),
             "latency": to_float(rec.get("latency_ms")),
             "augment": to_bool(rec.get("augment")),
             "imgsz": to_float(rec.get("imgsz")),
+            "seed": to_float(rec.get("seed")) if has_seed else None,
         })
-    return rows, failed, len(failed)
+    return rows, failed, len(failed), has_seed
 
 
 def pick_baseline(rows: list[dict], requested: str | None) -> dict | None:
@@ -286,6 +292,85 @@ def write_imgsz_table(rows: list[dict], csv_name: str, out_dir: Path) -> None:
     print(f"[输出] {path}")
 
 
+def _mean_std(values: list[float]) -> tuple[float, float | None]:
+    """均值与样本标准差（ddof=1）；样本少于 2 个时标准差无定义。"""
+    mean = sum(values) / len(values)
+    if len(values) < 2:
+        return mean, None
+    var = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+    return mean, var ** 0.5
+
+
+def write_seeds_table(rows: list[dict], csv_name: str, out_dir: Path,
+                      has_seed_col: bool) -> None:
+    """同模型多行（多种子重复实验）聚合成 mean ± std 表。
+
+    触发条件：csv 含 seed 列；或同模型在同一 imgsz、非 TTA 条件下出现多行
+    （视为重复实验）。分辨率消融（同模型不同 imgsz）不会被误聚合。
+    """
+    base = main_rows(rows)
+    grouped: dict[str, list[dict]] = {}
+    for r in base:
+        grouped.setdefault(r["model"], []).append(r)
+
+    multi: dict[str, list[dict]] = {}
+    for model, group in grouped.items():
+        if len(group) < 2:
+            continue
+        if not has_seed_col and len({r["imgsz"] for r in group}) > 1:
+            continue  # 同模型多 imgsz = 分辨率消融，不是重复实验
+        multi[model] = group
+    if not multi:
+        return
+
+    entries: list[dict] = []
+    for model, group in multi.items():
+        item: dict = {"model": model, "n": len(group)}
+        for key in ("map50", "map5095", "precision", "recall"):
+            values = [r[key] for r in group if r[key] is not None]
+            item[key] = _mean_std(values) if values else (None, None)
+        item["seeds"] = sorted({int(r["seed"]) for r in group if r["seed"] is not None})
+        entries.append(item)
+    entries.sort(key=lambda e: (e["map5095"][0] is not None, e["map5095"][0] or -1.0),
+                 reverse=True)
+
+    def cell(pair: tuple[float | None, float | None]) -> str:
+        mean, std = pair
+        if mean is None:
+            return "—"
+        return f"{mean:.3f} ± {std:.3f}" if std is not None else f"{mean:.3f} ± —"
+
+    best = max((e["map5095"][0] for e in entries if e["map5095"][0] is not None), default=None)
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    lines = [
+        f"<!-- 数据来源：{csv_name} ｜ 生成时间：{now} -->",
+        "# 表 多种子重复实验（mean ± std）",
+        "",
+        "| Model | n | mAP@0.5 | mAP@0.5:0.95 | P | R |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for e in entries:
+        map5095_text = cell(e["map5095"])
+        lines.append("| " + " | ".join([
+            e["model"],
+            str(e["n"]),
+            cell(e["map50"]),
+            md_wrap(map5095_text, best is not None and e["map5095"][0] == best),
+            cell(e["precision"]),
+            cell(e["recall"]),
+        ]) + " |")
+
+    seeds_desc = "；".join(
+        f"{e['model']}: seed={e['seeds']}" for e in entries if e["seeds"]) if has_seed_col else ""
+    note = ("表注：std 为样本标准差（ddof=1）；n 为参与聚合的重复次数。"
+            + (f"使用的随机种子：{seeds_desc}。" if seeds_desc else
+               "csv 无 seed 列，按“同模型 + 同 imgsz 多行”识别为重复实验。"))
+    lines += ["", note, ""]
+    path = out_dir / "paper_table_seeds.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[输出] {path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="benchmark.csv -> 论文表格（Markdown/LaTeX）")
     parser.add_argument("--csv", default=str(Path("research_out") / "benchmark.csv"),
@@ -301,7 +386,7 @@ def main() -> None:
         print("       请先运行：python training\\research\\benchmark.py")
         sys.exit(1)
 
-    rows, failed, failed_count = load_rows(csv_path)
+    rows, failed, failed_count, has_seed = load_rows(csv_path)
     if not rows:
         print("[错误] csv 中没有成功结果（status 全部为 error？）")
         sys.exit(1)
@@ -315,6 +400,7 @@ def main() -> None:
     write_main_table(rows, csv_path.name, out_dir, failed, baseline, total_success=len(rows))
     write_tta_table(rows, csv_path.name, out_dir)
     write_imgsz_table(rows, csv_path.name, out_dir)
+    write_seeds_table(rows, csv_path.name, out_dir, has_seed)
     print(f"完成：成功 {len(rows)} 行，失败 {failed_count} 行")
 
 

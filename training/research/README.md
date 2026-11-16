@@ -1,21 +1,27 @@
 # 论文级实验方案（training/research）
 
-本目录提供三件可复现的实验工具，产出投稿中文核心（南核 / CSCD）所需的表格与审计证据。
-所有命令均在**项目根目录**（`tea-action/`）下执行，输出默认写到 `research_out/`。
+本目录提供可复现的实验工具，产出投稿中文核心（南核 / CSCD）与 SCI 期刊所需的表格、
+统计检验与审计证据。所有命令均在**项目根目录**（`tea-action/`）下执行，
+输出默认写到 `research_out/`。
 
 ```
 training/research/
-  audit_dataset.py   数据质量与近重复泄漏审计（dHash-64，分桶近邻搜索）
+  common.py          共用底座：data.yaml 解析 / 标签读取 / IoU 贪心匹配
+  audit_dataset.py   数据质量与近重复泄漏审计（dHash 或 pHash-64，分桶近邻搜索）
   benchmark.py       多模型横向对比（产出表 1 原始 csv）
-  make_tables.py     benchmark.csv -> paper_table.md / paper_table.tex / 消融表
+  make_tables.py     csv -> paper_table.md/.tex / 消融表 / 多种子 mean±std 表
+  stats_eval.py      bootstrap 95% CI + McNemar 配对显著性检验
+  error_analysis.py  FP/FN 裁剪图导出 + 按类别/尺寸/置信度统计
+  seed_study.py      多种子重复实验（train+val，输出 mean±std）
   README.md          本文件
 ```
 
-依赖仅用到项目已有环境：Python 3.11、ultralytics、Pillow、numpy、pandas、pyyaml，**不新增任何依赖**。
+依赖仅用到项目已有环境：Python 3.11、ultralytics、Pillow、numpy、pandas、pyyaml、
+opencv-python（仅 pHash 需要），**不新增任何依赖**，统计量全部手写实现（不使用 scipy）。
 
 ---
 
-## 一、三条命令
+## 一、六条命令
 
 ### 1. 数据审计（先做，决定后面的实验是否可信）
 
@@ -28,9 +34,10 @@ python training\research\audit_dataset.py
 ```bat
 python training\research\audit_dataset.py --data-root training\datasets\tea_leaf_disease --out research_out
 python training\research\audit_dataset.py --hash-threshold 6
+python training\research\audit_dataset.py --hash phash --hash-threshold 10   :: pHash（需 cv2，缺失时自动回退 dHash）
 ```
 
-产出：`research_out\audit.json`、`research_out\audit.md`。
+产出：`research_out\audit.json`、`research_out\audit.md`（md 里注明所用哈希类型）。
 
 `audit.md` 里必须抄进论文的数字：
 
@@ -76,6 +83,46 @@ python training\research\make_tables.py --csv research_out\benchmark.csv --out-d
 注意：`benchmark.py` 每次只写一种 `augment` 取值。做 TTA 消融时用不同的 `--out`
 分别跑 `--augment` 关/开，再把两次的 csv 合并成一个（保留表头一行）后交给
 `make_tables.py --csv merged.csv`，否则 `paper_table_tta.md` 不会生成。
+
+若 csv 含 `seed` 列（或有"同模型 + 同 imgsz"的多行重复实验），会额外生成
+`paper_table_seeds.md`：Model / mAP@0.5 / mAP@0.5:0.95 / P / R 均为 mean ± std
+（样本标准差 ddof=1）。分辨率消融（同模型不同 imgsz）不会被误判为重复实验。
+
+### 4. 统计显著性（bootstrap 95% CI + McNemar）
+
+```bat
+python training\research\stats_eval.py --model data\models\tea_yolo.pt --data training\datasets\tea_leaf_disease\data.yaml
+python training\research\stats_eval.py --model runs\a\best.pt,runs\b\best.pt --bootstrap 2000 --seed 42
+python training\research\stats_eval.py --model data\models\tea_yolo.pt --data <yaml> --imgsz 64 --conf 0.01 --device cpu --bootstrap 50
+```
+
+产出：`research_out\stats\per_image.csv`（每模型每图一行 TP/FP/FN）、`stats.json`、`stats.md`。
+内容：micro P/R/F1 及其 95% bootstrap CI；给两个模型时附 McNemar 2×2 配对表、
+连续性校正 χ²、p 值，以及 F1 差值的配对 bootstrap CI。
+口径：某图"检测正确" = 该图无 FP 且无 FN；TP 要求同类且 IoU ≥ `--iou`。
+
+### 5. 误差分析（FP / FN 裁剪图与统计）
+
+```bat
+python training\research\error_analysis.py --model data\models\tea_yolo.pt --data <yaml>
+python training\research\error_analysis.py --model runs\best.pt --data <yaml> --max-samples 100
+```
+
+产出：`errors.csv`（type/image/class/conf/iou/area_ratio/w/h/size_bin）、
+`fp\`、`fn\` 裁剪图（外扩 20%、防越界，每类最多 `--max-samples` 张）、`error_summary.md`
+（按类别、COCO 尺寸口径 small/medium/large、置信度分箱统计，并给出"最容易被误判成什么"）。
+无检测/无 GT 时只输出空表，不报错。
+
+### 6. 多种子重复实验（mean ± std）
+
+```bat
+python training\research\seed_study.py --seeds 1,2,3,4,5 --data <yaml> --dry-run
+python training\research\seed_study.py --seeds 1,2,3,4,5 --data <yaml> --epochs 100 --batch 8 --device 0
+```
+
+每个 seed 执行 `yolo detect train ... seed=S deterministic=True` 后对 `best.pt` 执行
+`yolo detect val`，解析 P/R/mAP50/mAP50-95，产出 `seeds.csv`、`seeds.md`（逐 seed + 汇总
+mean ± std 与样本量）。`--dry-run` 只打印命令（每 seed 一行，train && val），完全离线可用。
 
 ---
 
@@ -237,6 +284,94 @@ python training\calibrate_conf.py --model data\models\tea_yolo.pt --imgsz 640
 - [ ] 表 1~表 5、图 1~图 6 齐全，编号与正文引用一致
 - [ ] 明确写出数据划分方式、泄漏审计结论、跨域指标下降原因
 - [ ] 讨论局限：类别不均衡、遮挡/小目标、单区域数据、推理硬件
+
+---
+
+## 六、SCI 级实验规范（投稿前逐条对照）
+
+### 6.1 数据：划分方式与跨域验证
+
+| 要求 | 具体做法 | 本仓库对应手段 |
+| --- | --- | --- |
+| 划分不随机 | 以"茶园编号 × 拍摄日期 × 设备"为分组键整组进 split，正文写出划分键 | `audit_dataset.py` 报告泄漏率与前 20 对近重复，作为划分是否可信的证据 |
+| 自有跨域测试集 ≥200 张 | 另建 `training/datasets/tea_field_test/`，独立标注，只测不训、不调参 | `benchmark.py --data <跨域 yaml> --out research_out\cross_domain` + `stats_eval.py` 给 CI |
+| in-domain vs out-of-domain 指标差 | 同一权重分别在同分布 val 与跨域 test 上评估，报告 ΔmAP50 与 ΔmAP50-95 | `benchmark.csv` 两次运行后合并成表 3（跨域表），差值列由 `make_tables.py` 的 Δ 列口径给出 |
+| 泄漏可查 | 报告近重复对数、泄漏率、示例文件名对 | `audit.md` 第 4 节；dHash 与 pHash 两种哈希交叉验证（`--hash phash`） |
+
+### 6.2 对比：可复现基线 + 文献数值分开标注
+
+- **可复现基线 ≥4 个**：`yolov8n / yolov8s / yolov8m / yolo11n / yolo11s` 同一 data.yaml、
+  同一 `imgsz=640`、同一验证集、同一 `conf/iou`，一次 `benchmark.py` 跑完。
+- **文献数值**：从已发表论文抄录的 mAP 必须单独一列或单独一张表，列头标明
+  **reported (文献原文)**，本仓库复现的写 **reproduced (本机复现)**；
+  **禁止把 reported 与 reproduced 混在同一列比较**——数据集划分、imgsz、后处理都不同，
+  混表是审稿人最容易抓的造假嫌疑。
+- 表格必须写清：数据集版本、划分、imgsz、是否 TTA、GPU 型号；同一格不得出现两种来源。
+
+### 6.3 统计：方差、置信区间、显著性检验
+
+| 项 | 最低要求 | 命令 / 输出 |
+| --- | --- | --- |
+| 重复实验 | ≥5 seeds，报告 mean ± std（样本标准差 ddof=1） | `seed_study.py --seeds 1,2,3,4,5` → `seeds.md`；`make_tables.py` → `paper_table_seeds.md` |
+| 置信区间 | bootstrap ≥1000 次，报告 95% CI（2.5%/97.5% 分位） | `stats_eval.py --bootstrap 1000` → `stats.md` 的 `P [lo, hi]` 格式 |
+| 两模型比较 | McNemar 配对检验（连续性校正 χ²，p=erfc(√(χ²/2))），写清 α=0.05 | `stats_eval.py --model A.pt,B.pt` → 2×2 表 + χ² + p + F1 差值 CI |
+| 方法说明 | 正文必须写：检验方法、配对单位（整图）、显著性水平、是否校正 | `stats.md` 已按此格式给出，可直接改写进方法与结果 |
+
+报告格式示例（不要省略 CI）：`F1 = 0.812 [0.789, 0.834]`、`0.740 ± 0.006 (n=5)`、
+`χ²=4.17, df=1, p=0.041 < 0.05`。
+
+### 6.4 复杂度：精度之外的必填项
+
+- **参数量 / GFLOPs**：`benchmark.py` 的 `params`、`gflops` 列（数参数 + `model.info()`）。
+- **单图延迟**：`benchmark.py --latency-image <图片>`，warmup 3 次 + 计时 20 次取中位数。
+- **吞吐（FPS / images·s⁻¹）**：同一 batch 下用 `batch / 平均单批耗时` 计算，
+  固定 batch 与精度（FP32/FP16）后再报。
+- **必须注明**：GPU 型号、驱动版本、CUDA/cuDNN、torch 与 ultralytics 版本、batch、精度、
+  是否 TensorRT；缺一项就会被要求重做（不同硬件上的延迟不可比）。
+- 建议同时报 CPU 端侧延迟（`--device cpu`），茶园移动端部署更关心这个。
+
+### 6.5 误差分析：错在哪，比错多少更重要
+
+- **FP / FN 样例**：`error_analysis.py` 导出 `fp\`、`fn\` 裁剪图（外扩 20%），
+  文件名含类别与置信度，直接组成图 5 的 2×3 拼图。
+- **按类别统计**：各类 FP/FN 计数 + 漏检类别集中在哪些病斑（相似类别混淆）。
+- **按尺寸统计**：COCO 口径 small(<32²) / medium(<96²) / large，说明小目标是否为主因。
+- **按置信度分箱**：0.25-0.40 / 0.40-0.60 / 0.60+，区分"高置信度误报"（最有害）与
+  "低置信度漏检"；FN 一列填"与该真值重叠最多的预测置信度"，无重叠则单独成行。
+- **误判来源**：`error_summary.md` 第 4 节给出"最容易被误判成什么"（跨类 IoU > 0.1 的配对）。
+
+### 6.6 可复现：审稿人要能重跑出同一个数
+
+- 训练固定 `seed` + `deterministic=True`（`seed_study.py` 已写入命令）；
+- 归档每个 run 的 `args.yaml`（`<out>/runs/seed_S/args.yaml`），附录给出关键超参表；
+- 记录环境：Python / torch / ultralytics / CUDA / GPU / 驱动版本（正文"实验环境"一小节）；
+- 数据可用性声明：数据来源、许可证、下载日期与校验和；自有跨域数据说明采集设备与标注规范；
+- 所有表格由脚本从 csv 生成，不手改数字；csv 与 md/tex 一并作为补充材料提交。
+
+### 6.7 图表清单（编号与正文引用一致）
+
+| 编号 | 内容 | 生成方式 |
+| --- | --- | --- |
+| 图 1 | 整体流程（数据 → 训练 → 评估 → 部署） | 手绘/绘图工具，标注输入输出尺寸 |
+| 图 2 | 数据集分布（类别长尾、尺寸分布、划分） | `audit.md` 第 1~3 节数据 + 柱状图 |
+| 图 3 | PR 曲线（各模型同图对比） | `model.val(plots=True)` 的 `PR_curve.png` |
+| 图 4 | 混淆矩阵（含背景行/列） | `confusion_matrix_normalized.png` |
+| 图 5 | FP / FN 示例（2×3 拼图，含类别与置信度） | `error_analysis.py` 导出的 `fp/`、`fn/` |
+| 表 1 | 多模型对比（P/R/mAP/Params/延迟） | `paper_table.md` / `.tex` |
+| 表 2 | 消融（imgsz / TTA / 切片 / 阈值） | `paper_table_imgsz.md`、`paper_table_tta.md` |
+| 表 3 | 跨域测试（in-domain vs out-of-domain 与 Δ） | `benchmark.py --data <跨域 yaml>` |
+| 表 4 | 统计检验（mean±std、95% CI、McNemar p） | `paper_table_seeds.md`、`stats.md` |
+
+### 6.8 会被审稿人直接拒稿的 6 个问题 → 本仓库的解决手段
+
+| # | 拒稿理由 | 本仓库的对应手段 |
+| --- | --- | --- |
+| 1 | **数据泄漏**：随机划分 + 近重复，mAP 虚高 | `audit_dataset.py`（dHash/pHash）给泄漏率与前 20 对，正文写明按茶园/批次重划分 |
+| 2 | **只在单数据集自测**，无跨域/外部验证 | 自建 ≥200 张跨域测试集，`benchmark.py --data <跨域 yaml>` + 表 3 报 ΔmAP |
+| 3 | **无基线或基线不公**（同条件不可复现） | `benchmark.py` 固定 data/imgsz/conf/iou 跑 ≥4 个基线；reported 与 reproduced 分列 |
+| 4 | **单次结果无方差**，"优于"不成立 | `seed_study.py` 5 seeds 的 mean±std + `stats_eval.py` bootstrap CI |
+| 5 | **无显著性检验**，差异落在噪声内 | `stats_eval.py` 的 McNemar（χ²、p、α=0.05）与 F1 差值配对 CI |
+| 6 | **误差分析缺失**，只报聚合指标 | `error_analysis.py` 的 FP/FN 裁剪图 + 按类别/尺寸/置信度统计与误判来源 |
 
 ---
 
