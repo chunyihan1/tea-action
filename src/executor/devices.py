@@ -29,6 +29,13 @@ SPRAY_PRESSURE_BAR = 3.5       # 喷杆喷头工作压力 bar
 # 默认区域（无摄像头/旧调用方不指定区域时使用）
 DEFAULT_ZONE = "global"
 
+# ---- 硬件安全硬限制（由独立看门狗强制执行，不依赖决策循环存活）----
+# 单次最长作业时长（分钟）：上层传入更长的时长也会被截断
+MAX_OPEN_MIN = {"drip_valve": 120.0, "spray_boom": 30.0}
+# 每日累计最长作业时长（分钟）：按「区域 + 设备 + 日期」累计
+MAX_DAILY_MIN = {"drip_valve": 240.0, "spray_boom": 60.0}
+WATCHDOG_INTERVAL_S = 1.0     # 看门狗巡检间隔（秒）
+
 
 def _ts() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -166,6 +173,11 @@ class ActuatorBus:
         self._lock = threading.RLock()
         # 兼容旧属性：默认区设备字典（同一个对象，不会被替换）
         self.devices = self._zone_devices(DEFAULT_ZONE)
+        # 每日累计用量：(zone, device, 日期) -> 分钟
+        self._usage: dict[tuple[str, str, str], float] = {}
+        # 独立看门狗：强制时长与每日累计上限，不依赖决策循环是否还活着
+        self._watchdog: threading.Thread | None = None
+        self._watchdog_stop = threading.Event()
 
     # ---------- 区域 ----------
     def _zone_devices(self, zone: str | None) -> dict:
@@ -182,6 +194,121 @@ class ActuatorBus:
         with self._lock:
             keys = [k for k in self._zones if k != DEFAULT_ZONE]
             return ([DEFAULT_ZONE] if DEFAULT_ZONE in self._zones else []) + keys
+
+    # ---------- 每日用量与安全看门狗 ----------
+    @staticmethod
+    def _today() -> str:
+        return datetime.now().date().isoformat()
+
+    def _usage_key(self, zone: str, device: str) -> tuple[str, str, str]:
+        return (str(zone), device, self._today())
+
+    def daily_used(self, zone: str | None, device: str) -> float:
+        """某区域某设备今日累计作业分钟数。"""
+        with self._lock:
+            return round(self._usage.get(
+                self._usage_key(str(zone or DEFAULT_ZONE), device), 0.0), 3)
+
+    def daily_remaining(self, zone: str | None, device: str) -> float:
+        """今日剩余可用分钟数（无上限配置时返回 0，调用方需按有上限处理）。"""
+        cap = float(MAX_DAILY_MIN.get(device, 0.0))
+        return max(0.0, cap - self.daily_used(zone, device))
+
+    def _start_watchdog(self) -> None:
+        """首次执行时启动看门狗（守护线程，进程退出即结束）。"""
+        with self._lock:
+            if self._watchdog is not None and self._watchdog.is_alive():
+                return
+            self._watchdog = threading.Thread(
+                target=self._watchdog_loop, name="actuator-watchdog", daemon=True)
+            self._watchdog.start()
+
+    def shutdown(self) -> None:
+        """停止看门狗并关闭所有设备（测试/进程退出用）。"""
+        self._watchdog_stop.set()
+        with self._lock:
+            self.reset()
+
+    def _watchdog_loop(self) -> None:
+        """独立巡检：累计用量 → 超时关闭 → 每日上限关闭。
+
+        即使 Agent 决策循环卡死/崩溃，这里仍会按时关闭阀门与喷杆。
+        """
+        last = time.monotonic()
+        while not self._watchdog_stop.wait(WATCHDOG_INTERVAL_S):
+            now = time.monotonic()
+            dt_min = (now - last) / 60.0
+            last = now
+            try:
+                self._accrue_usage(dt_min)
+                # 单次时长上限已按设备截断，这里用各设备最大值作为总兜底
+                self.auto_timeout_check(max_minutes=max(MAX_OPEN_MIN.values()))
+                self._enforce_daily_caps()
+            except Exception:  # noqa: BLE001 - 看门狗自身异常不能杀死线程
+                continue
+
+    def _accrue_usage(self, dt_min: float) -> None:
+        """把最近一个巡检周期内处于作业状态的设备计入当日累计。"""
+        with self._lock:
+            for zone, devices in self._zones.items():
+                for name, dev in devices.items():
+                    active = ((name == "drip_valve" and dev.state == "open")
+                              or (name == "spray_boom" and dev.state == "on"))
+                    if not active:
+                        continue
+                    key = self._usage_key(zone, name)
+                    self._usage[key] = self._usage.get(key, 0.0) + dt_min
+
+    def _enforce_daily_caps(self) -> None:
+        """达到每日累计上限的设备强制关闭。"""
+        events: list[dict] = []
+        with self._lock:
+            for zone, devices in self._zones.items():
+                for name, dev in devices.items():
+                    active = ((name == "drip_valve" and dev.state == "open")
+                              or (name == "spray_boom" and dev.state == "on"))
+                    cap = float(MAX_DAILY_MIN.get(name, 0.0))
+                    if not active or cap <= 0:
+                        continue
+                    used = self._usage.get(self._usage_key(zone, name), 0.0)
+                    if used < cap:
+                        continue
+                    reason = f"达到每日累计上限 {cap:.0f} 分钟，强制停止"
+                    ev = dev.close(reason) if name == "drip_valve" else dev.off(reason)
+                    ev["zone"] = zone
+                    ev["daily_used_min"] = round(used, 2)
+                    ev["daily_cap_min"] = cap
+                    events.append(ev)
+        for event in events:
+            self._broadcast(event)
+
+    def _clamp_open(self, zone: str, action: dict) -> tuple[float | None, dict | None]:
+        """截断单次时长并校验每日余量；返回 (允许的时长, 拦截事件)。"""
+        device = action.get("device")
+        cap_open = float(MAX_OPEN_MIN.get(device, 30.0))
+        req = action.get("duration_min")
+        try:
+            duration = float(req) if req is not None else cap_open
+        except (TypeError, ValueError):
+            duration = cap_open
+        duration = max(0.0, min(duration, cap_open))
+        remaining = self.daily_remaining(zone, device)
+        used = self.daily_used(zone, device)
+        cap_daily = float(MAX_DAILY_MIN.get(device, 0.0))
+        if remaining <= 0:
+            return None, {
+                "kind": "actuator_blocked",
+                "zone": zone,
+                "device": device,
+                "operation": action.get("op"),
+                "reason": f"今日累计已达 {cap_daily:.0f} 分钟上限，拒绝开启",
+                "requested_min": req,
+                "max_duration_min": cap_open,
+                "daily_used_min": used,
+                "daily_cap_min": cap_daily,
+                "ts": _ts(),
+            }
+        return min(duration, remaining), None
 
     # ---------- 事件订阅 ----------
     def subscribe(self, listener: Callable[[dict], None]) -> None:
@@ -205,6 +332,7 @@ class ActuatorBus:
         zone  : 区域标识（一个摄像头 = 一个区域）；缺省为默认区 "global"。
         """
         key = str(zone or DEFAULT_ZONE)
+        self._start_watchdog()
         events: list[dict] = []
         with self._lock:
             devices = self._zone_devices(key)
@@ -215,6 +343,12 @@ class ActuatorBus:
                 op = a.get("op")
                 reason = a.get("reason", "")
                 dur = a.get("duration_min")
+                if op in ("open", "on"):
+                    # 单次时长截断 + 每日累计上限校验，超限直接拒绝
+                    dur, blocked = self._clamp_open(key, a)
+                    if blocked is not None:
+                        events.append(blocked)
+                        continue
                 if op == "open":
                     ev = dev.open(dur, reason)
                 elif op == "close":
@@ -227,6 +361,11 @@ class ActuatorBus:
                     continue
                 # 事件里统一带上区域标识，前端据此只让该区域动画
                 ev["zone"] = key
+                if op in ("open", "on"):
+                    # 记录安全限额与今日累计，便于审计「为什么只喷了这么久」
+                    ev["max_duration_min"] = MAX_OPEN_MIN.get(a.get("device"))
+                    ev["daily_cap_min"] = MAX_DAILY_MIN.get(a.get("device"))
+                    ev["daily_used_min"] = self.daily_used(key, a.get("device"))
                 events.append(ev)
         # 监听器可能执行任意用户代码，不能在持有执行器锁时回调；否则监听器
         # 内部若查询执行器状态，就会把其他线程一起卡住，形成锁顺序死锁。

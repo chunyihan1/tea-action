@@ -230,8 +230,16 @@ def test_decision():
     d = rule.decide({**base, "soil": {"value": 42.0},
                      "detections": {"summary": {"total": 0, "diseases": []}, "detections": []}}, state)
     assert d["decision_type"] == "irrigate" and d["actions"][0]["device"] == "drip_valve"
+    # 模拟检测（演示帧/模拟推理）→ 连续多次检出也不喷（来源闸门）
+    fake = {"source": "demo_frame", "backend": "sim",
+            "summary": {"total": 1, "diseases": ["Leaf rust"]},
+            "detections": [{"class": "Leaf rust", "conf": 0.92}]}
+    for _ in range(3):
+        df = rule.decide({**base, "soil": {"value": 60.0}, "detections": fake}, state)
+        assert df["decision_type"] != "spray"
     # 连续 1 次检出 → 不喷（防抖）
-    det = {"summary": {"total": 1, "diseases": ["Leaf rust"]},
+    det = {"source": "usb_cam", "backend": "ultralytics",
+           "summary": {"total": 1, "diseases": ["Leaf rust"]},
            "detections": [{"class": "Leaf rust", "conf": 0.72}]}
     d2 = rule.decide({**base, "soil": {"value": 60.0}, "detections": det}, state)
     assert d2["decision_type"] != "spray"
@@ -239,7 +247,8 @@ def test_decision():
     d3 = rule.decide({**base, "soil": {"value": 60.0}, "detections": det}, state)
     assert d3["decision_type"] == "spray" and any(a["op"] == "on" for a in d3["actions"])
     # 低置信度误检 → 不喷
-    low = {"summary": {"total": 1, "diseases": ["Leaf rust"]},
+    low = {"source": "usb_cam", "backend": "ultralytics",
+           "summary": {"total": 1, "diseases": ["Leaf rust"]},
            "detections": [{"class": "Leaf rust", "conf": 0.35}]}
     d4 = rule.decide({**base, "soil": {"value": 60.0}, "detections": low}, state)
     assert d4["decision_type"] != "spray"

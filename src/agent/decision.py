@@ -31,6 +31,11 @@ IRRIGATE_STOP = 68.0       # 高于该值停止浇水（滞回）
 IRRIGATE_TARGET = 72.0     # 灌溉目标湿度
 MIN_PER_PCT = 1.2          # 每差 1% 湿度约需滴灌时长(分钟)
 SPRAY_CONF = 0.50          # 病害置信度阈值
+# 视觉来源闸门：只有真实摄像头 + 真实模型推理的结果才允许驱动打药。
+# 摄像头断线时 detector 会降级为 SimDetector（source=demo_frame, backend=sim），
+# 其结果只能"看"，不能"照做"——否则等于凭一张假图打开喷杆。
+TRUSTED_BACKENDS = {"ultralytics"}
+TRUSTED_SOURCES = {"usb_cam", "net_cam"}
 CONSECUTIVE_SPRAY = 2      # 连续 N 次检出病害才打药（防抖动）
 CONSECUTIVE_STOP = 3       # 连续 N 次无病害才停
 SPRAY_COOLDOWN_MIN = 30.0  # 上次喷雾结束后 N 分钟内不重复开启喷雾（冷却防抖）
@@ -62,6 +67,16 @@ def _diseases(detections: dict) -> list[dict]:
     """返回置信度达标的病害检测。"""
     return [d for d in detections.get("detections", [])
             if d["class"] != "Healthy" and _num(d.get("conf")) >= SPRAY_CONF]
+
+
+def vision_trusted(detections: dict) -> bool:
+    """视觉结果是否可信到可以驱动执行器。
+
+    只有 backend=ultralytics（真实模型推理）且 source 为真实摄像头时才可信；
+    演示帧、模拟推理、无摄像头时的合成画面一律不可信，只能展示不能作业。
+    """
+    return (str(detections.get("backend") or "") in TRUSTED_BACKENDS
+            and str(detections.get("source") or "") in TRUSTED_SOURCES)
 
 
 def _minutes_since(v) -> float | None:
@@ -110,13 +125,23 @@ def _spray_decision(detections: dict, daily: list[dict], now: dict,
     """
     actions: list[dict] = []
     diseases = _diseases(detections)
+    trusted = vision_trusted(detections)
     rainy = _max_precip(daily) >= RAIN_LIMIT_MM
     windy = _max_wind(daily, now) >= WIND_LIMIT_LEVEL
     temp = _num(now.get("temp")) if now else 0.0
     hum = _num(now.get("humidity")) if now else 100.0
 
     if boom_state == "on":
-        # 正在作业：无病害且连续 miss 达标 → 停；遇雨/大风 → 立即停
+        # 正在作业：视觉来源突然不可信（摄像头掉线/模型失效）→ 立即停，不凭假图继续喷
+        if not trusted:
+            actions.append({"device": "spray_boom", "op": "off",
+                            "reason": "停止喷药：视觉来源不可信（演示帧/模拟推理）"})
+            counters["spray_hits"] = 0
+            counters["spray_misses"] = 0
+            state["last_spray_end_at"] = datetime.now().isoformat(timespec="seconds")
+            state["vision_gate_hint"] = "视觉来源不可信，已停止喷药并转入观察"
+            return actions
+        # 无病害且连续 miss 达标 → 停；遇雨/大风 → 立即停
         if diseases:
             counters["spray_misses"] = 0
         else:
@@ -137,6 +162,16 @@ def _spray_decision(detections: dict, daily: list[dict], now: dict,
             state["spray_cooldown_hint"] = (
                 f"喷雾冷却中：距上次喷完 {cooldown:.0f} 分钟，"
                 f"{SPRAY_COOLDOWN_MIN:.0f} 分钟内不重复喷药")
+            return actions
+        if not trusted:
+            # 视觉来源闸门：演示帧/模拟推理/断线合成画面 × 绝不据此打药。
+            # 降温喷灌由气象规则驱动、与视觉无关，仍然保留。
+            counters["spray_hits"] = 0
+            counters["spray_misses"] = 0
+            state["vision_gate_hint"] = "视觉来源不可信（演示帧/模拟推理），不据此打药"
+            if temp >= COOL_TEMP and hum < COOL_HUMIDITY and not rainy:
+                actions.append({"device": "spray_boom", "op": "on", "duration_min": 5.0,
+                                "reason": f"气温 {temp:.0f}°C 且湿度 {hum:.0f}%，短时喷灌降温增湿"})
             return actions
         if rainy or windy:
             counters["spray_hits"] = 0
@@ -211,6 +246,10 @@ def decide(inputs: dict, state: dict | None = None) -> dict:
     cooldown_hint = state.pop("spray_cooldown_hint", None)
     if cooldown_hint:
         parts.append(cooldown_hint)
+    # 视觉来源闸门提示（不可信来源抑制喷雾时由 _spray_decision 写入，仅当轮有效）
+    gate_hint = state.pop("vision_gate_hint", None)
+    if gate_hint:
+        parts.append(gate_hint)
     summary = "；".join(parts) if parts else "暂无有效输入"
 
     return {

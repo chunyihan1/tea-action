@@ -277,6 +277,8 @@ class AgentRunner:
                 "detections": det.get("detections", []),
                 "summary": det.get("summary", {}),
                 "det_source": det.get("source", "demo_frame"),
+                # 真实推理后端（ultralytics）还是模拟降级（sim）：决策层据此判断可否驱动执行器
+                "det_backend": det.get("backend", "sim"),
                 "raw_frame": frame,
             })
         return cams
@@ -303,7 +305,8 @@ class AgentRunner:
         max_conf = max([c.get("summary", {}).get("max_conf", 0.0) or 0.0 for c in dets] or [0.0])
         return {
             "source": dets[0].get("det_source", "demo_frame"),
-            "backend": "ultralytics" if any(c.get("det_source") == "usb_cam" or c.get("last_source") in ("usb_cam", "net_cam") for c in dets) else "sim",
+            # 取真实推理后端：摄像头在线但模型降级为 sim 时，总览也不能标成 ultralytics
+            "backend": "ultralytics" if any(c.get("det_backend") == "ultralytics" for c in dets) else "sim",
             "detections": [d for c in dets for d in c.get("detections", [])],
             "summary": {
                 "total": total,
@@ -332,9 +335,13 @@ class AgentRunner:
         dets = cam.get("detections") or []
         diseases = list(summary.get("diseases") or [])
         last_source = cam.get("last_source", "demo_frame")
+        # backend 必须取推理后端真实值：摄像头在线但模型未加载时是 sim，
+        # 不能因为画面来自 usb_cam 就当成可信推理结果（否则模拟框会驱动打药）。
+        backend = cam.get("det_backend") or (
+            "ultralytics" if last_source in ("usb_cam", "net_cam") else "sim")
         return {
             "source": last_source,
-            "backend": "ultralytics" if last_source in ("usb_cam", "net_cam") else "sim",
+            "backend": backend,
             "detections": dets,
             "summary": {
                 "total": int(summary.get("total", len(dets)) or 0),
