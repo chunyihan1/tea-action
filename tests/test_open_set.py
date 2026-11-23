@@ -164,6 +164,50 @@ def test_model_to_known_mapping_by_short_name():
 
 
 # ============================================================
+# 2b. 选择性预测与代价比扫描（纯函数，可手算）
+# ============================================================
+def test_aurc_perfect_separation():
+    """完美分离：标准 AURC 不为 0（覆盖率必然到 1），E-AURC 才为 0。
+
+    3 已知 + 2 未知、错误全排最后：风险在覆盖率 0.6/0.8/1.0 处为 0/0.25/0.40，
+    梯形积分 = 0.09；与完美排序基线重合，故 E-AURC = 0。
+    """
+    scores, errors = [0.9, 0.8, 0.7, 0.2, 0.1], [0, 0, 0, 1, 1]
+    assert ose.aurc(scores, errors) == pytest.approx(0.09, abs=1e-6)
+    assert ose.excess_aurc(scores, errors) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_aurc_uninformative_scores_approach_unknown_ratio():
+    """分数完全相同（不可分）时风险恒为未知占比 q，标准 AURC ≈ q。
+
+    E-AURC 在不可分时约为 q(1-q)，明显大于 0，说明排序没有带来任何收益。
+    """
+    q = 0.1
+    scores, errors = [0.5] * 10, [0.0] * 9 + [1.0]
+    assert ose.aurc(scores, errors) == pytest.approx(q, abs=0.02)
+    assert ose.excess_aurc(scores, errors) == pytest.approx(q * (1 - q), abs=0.02)
+
+
+def test_coverage_at_risk_hand_computed():
+    """4 已知 + 2 未知，分数降序为 K,K,K,U,U,K：risk=0 时只能覆盖前 3 个 → 3/6。"""
+    scores = [0.9, 0.8, 0.7, 0.5, 0.3, 0.1]
+    errors = [0, 0, 0, 1, 1, 0]
+    assert ose.coverage_at_risk(scores, errors, 0.0) == pytest.approx(0.5)
+    # 前 4 个累计错误率 1/4 = 0.25，第 5 个为 2/5 = 0.4 > 0.25
+    assert ose.coverage_at_risk(scores, errors, 0.25) == pytest.approx(4.0 / 6.0)
+
+
+def test_cost_ratio_sweep_more_conservative_at_higher_ratio():
+    """代价比越高，最优工作点越保守（转人工率不低于 1:1 的推荐 τ）。"""
+    known = [{"source": "known", "scores": {"msp": 0.02 + 0.05 * i}} for i in range(20)]
+    unknown = [{"source": "unknown", "scores": {"msp": 0.05 + 0.045 * i}} for i in range(20)]
+    rows = ose.scan_cost_ratios(known, unknown, len(unknown), "msp", [1, 10], n_images=40)
+    assert len(rows) == 2
+    assert rows[1]["referral_rate"] >= rows[0]["referral_rate"]
+    assert rows[1]["expected_cost_per_image"] is not None
+
+
+# ============================================================
 # 3. CLI --help
 # ============================================================
 def _run_help(script: Path) -> subprocess.CompletedProcess:

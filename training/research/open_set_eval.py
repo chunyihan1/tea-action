@@ -19,7 +19,11 @@
   - hook 因 Ultralytics 版本差异失败时优雅降级：只保留 MSP（取检测框 conf），
     并在 metrics.json / metrics.md 里写明 scorer_unavailable 原因，不崩溃；
   - 指标全部自行实现（AUROC 用秩和、AP 用 all-point 插值、FPR@TPR 用分位数），
-    不新增 sklearn 依赖。
+    不新增 sklearn 依赖；
+  - 选择性预测：框级标准 AURC 与 E-AURC（相对完美排序基线的超出量，完美分离=0）、
+    coverage@5% / coverage@10%，以及按图像聚合的两套 AURC（图内任一未知框未被拒识即算该图错误）；
+  - 代价比扫描：--cost-ratios 对每个 C_mis:C_ref 复用代价最优阈值扫描，
+    输出 cost_ratio.csv 与 decision_curve.png（对数横轴 + 推荐工作点竖线）。
 
 用法：
   python training\\research\\open_set_eval.py --model data\\models\\tea_yolo.pt ^
@@ -27,6 +31,8 @@
   python training\\research\\open_set_eval.py --model ... --split-dir ... ^
       --scorer msp,energy,proto --calib-ratio 0.05 --cost-mis 10 --cost-ref 1
   python training\\research\\open_set_eval.py --model ... --split-dir ... --conf 0.1 --device cpu
+  python training\\research\\open_set_eval.py --model ... --split-dir ... ^
+      --cost-ratios 1,5,10,50,100 --recommend-ratio 10
 """
 from __future__ import annotations
 
@@ -35,6 +41,7 @@ import csv
 import json
 import math
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -76,6 +83,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="已知类允许的误拒率，默认 0.05")
     parser.add_argument("--cost-mis", type=float, default=10.0, help="误诊代价 C_mis，默认 10")
     parser.add_argument("--cost-ref", type=float, default=1.0, help="转人工代价 C_ref，默认 1")
+    parser.add_argument("--cost-ratios", default="1,2,5,10,20,50,100",
+                        help="代价比扫描列表 C_mis:C_ref（C_ref 固定为 1），默认 1,2,5,10,20,50,100")
+    parser.add_argument("--recommend-ratio", type=float, default=10.0,
+                        help="决策曲线推荐工作点的代价比，默认 10；若不在列表中会自动追加")
     parser.add_argument("--conf", type=float, default=0.25, help="检测置信度阈值，默认 0.25")
     parser.add_argument("--imgsz", type=int, default=640, help="推理分辨率，默认 640")
     parser.add_argument("--device", default="auto", help="auto / cpu / 0，默认 auto")
@@ -181,6 +192,161 @@ def expected_cost(n_misdiagnosed: int, n_referred: int,
                   cost_mis: float, cost_ref: float) -> float:
     """期望代价 C_mis·误诊数 + C_ref·复核数（论文部署视角的唯一定义）。"""
     return float(cost_mis) * float(n_misdiagnosed) + float(cost_ref) * float(n_referred)
+
+
+# ============================================================
+# 选择性预测（AURC / coverage@risk，纯函数）
+# ============================================================
+def _selective_curve(scores, errors, tie_aware: bool = True
+                     ) -> tuple[np.ndarray, np.ndarray]:
+    """风险-覆盖率折线点（含起点 (0, 0)）。
+
+    方向约定：scores **越大越像已知**（越应先被覆盖）；调用方若手里是未知度，先取负。
+      - tie_aware=True：同分样本视为一个并列组，组内按随机顺序取期望——
+        组内第 j 位的累计错误数 = 组前累计 + 组内错误数·j/组大小。
+        这样结果不依赖输入先后顺序，且完全不可分时风险恒为未知占比。
+      - tie_aware=False：同分时把错误（未知框）排在后面，得到"完美排序"基线。
+    """
+    s = _arr(scores)
+    e = _arr(errors)
+    n = s.size
+    if n == 0 or e.size != n:
+        return np.zeros(1), np.zeros(1)
+    order = (np.argsort(-s, kind="mergesort") if tie_aware
+             else np.lexsort((e, -s)))          # 主键 -s 升序 = s 降序；次键错误升序
+    s_sorted, e_sorted = s[order], e[order]
+
+    coverage = [0.0]
+    risk = [0.0]
+    cum_err = 0.0
+    k = 0
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and s_sorted[j + 1] == s_sorted[i]:
+            j += 1
+        group_size = j - i + 1
+        group_err = float(e_sorted[i:j + 1].sum())
+        for step in range(1, group_size + 1):
+            k += 1
+            if tie_aware:
+                # 并列组内取期望：累计错误按组内均匀分布折算
+                errors_so_far = cum_err + group_err * step / group_size
+            else:
+                errors_so_far = cum_err + float(e_sorted[i + step - 1])
+            coverage.append(k / n)
+            risk.append(errors_so_far / k)
+        cum_err += group_err
+        i = j + 1
+    return np.asarray(coverage), np.asarray(risk)
+
+
+def _curve_area(coverage: np.ndarray, risk: np.ndarray) -> float:
+    """梯形法求覆盖率 0→1 的曲线下面积（区间长度已归一化为 1）。"""
+    if coverage.size < 2:
+        return 0.0
+    dx = coverage[1:] - coverage[:-1]
+    return float(np.sum(dx * (risk[1:] + risk[:-1]) / 2.0))
+
+
+def aurc(scores, errors) -> float:
+    """标准 AURC：风险-覆盖率曲线下面积（**分数越大越像已知**，未知度需先取负）。
+
+    曲线：按分数降序逐个覆盖，覆盖率 c=k/N，风险 = 前 k 个累计错误数 / k；
+    并列分数按组内期望处理，避免顺序任意性。
+
+    注意：标准定义下覆盖率必然到 1，因此 AURC 不会为 0——完美分离时其值
+    约等于未知样本占比（错误全被排在最后）。若需要"相对最优排序"的改进量，
+    用 excess_aurc()。
+    """
+    s = _arr(scores)
+    e = _arr(errors)
+    if s.size == 0 or e.size != s.size:
+        return float("nan")
+    return float(_curve_area(*_selective_curve(s, e, tie_aware=True)))
+
+
+def excess_aurc(scores, errors) -> float:
+    """E-AURC：相对"完美排序"（错误全部排在最后）的 AURC 超出量。
+
+    完美分离时为 0；排序越差越大，完全不可分时约为 q(1-q)（q 为未知占比）。
+    该指标与标准 AURC 必须同时报告，不能只用其中一个。
+    """
+    s = _arr(scores)
+    e = _arr(errors)
+    if s.size == 0 or e.size != s.size:
+        return float("nan")
+    raw = _curve_area(*_selective_curve(s, e, tie_aware=True))
+    oracle = _curve_area(*_selective_curve(s, e, tie_aware=False))
+    return float(max(0.0, raw - oracle))
+
+
+def coverage_at_risk(scores, errors, risk: float) -> float:
+    """错误率不超过 risk 时的最大覆盖率；**分数越大越像已知**（未知度需先取负）。
+
+    逐个前缀检查累计错误率，返回满足条件的最长前缀长度 / 样本数。
+    """
+    s = _arr(scores)
+    e = _arr(errors)
+    if s.size == 0 or e.size != s.size:
+        return float("nan")
+    order = np.argsort(-s, kind="mergesort")
+    e = e[order]
+    k = np.arange(1, s.size + 1, dtype=np.float64)
+    ok = np.cumsum(e) / k <= float(risk) + 1e-12
+    if not ok.any():
+        return 0.0
+    return float(k[np.where(ok)[0].max()] / s.size)
+
+
+def image_level_scores(items: list[dict], scorer: str
+                       ) -> tuple[list[float], list[float]]:
+    """把检测框聚合到图像级：(整图分数, 整图错误)，供图级 AURC 使用。
+
+    同一张图多个框时，取**最可疑框**（未知度最大）代表整图：只有该框未被拒识，
+    图内其余框才可能全部保留；一旦它被拒识，整图即转人工。因此
+    图分数 = -max(未知度)（取负后越大越"整图安全"、越应先覆盖），
+    图错误 = 该图至少含一个未知框（未拒识即为误诊）。
+    """
+    by_image: dict[str, list[dict]] = {}
+    for item in items:
+        if scorer not in item["scores"]:
+            continue
+        by_image.setdefault(item["image"], []).append(item)
+    scores: list[float] = []
+    errors: list[float] = []
+    for boxes in by_image.values():
+        worst = max(item["scores"][scorer] for item in boxes)
+        scores.append(-float(worst))
+        errors.append(1.0 if any(item["source"] == "unknown" for item in boxes) else 0.0)
+    return scores, errors
+
+
+def selective_metrics(known_items: list[dict], unknown_items: list[dict],
+                      scorer: str) -> dict:
+    """单个打分器的选择性预测指标：框级 AURC / coverage@5% / coverage@10% + 图级 AURC。"""
+    known_scores = [it["scores"][scorer] for it in known_items if scorer in it["scores"]]
+    unknown_scores = [it["scores"][scorer] for it in unknown_items if scorer in it["scores"]]
+    # 现有打分器输出的是未知度（越大越未知），AURC 约定越大越像已知，故统一取负
+    scores = [-v for v in known_scores] + [-v for v in unknown_scores]
+    errors = [0.0] * len(known_scores) + [1.0] * len(unknown_scores)
+    row = {
+        "n_known": len(known_scores),
+        "n_unknown": len(unknown_scores),
+        "aurc": _round_or_none(aurc(scores, errors)),
+        "e_aurc": _round_or_none(excess_aurc(scores, errors)),
+        "coverage_at_5pct": _round_or_none(coverage_at_risk(scores, errors, 0.05)),
+        "coverage_at_10pct": _round_or_none(coverage_at_risk(scores, errors, 0.10)),
+        "n_images": 0,
+        "aurc_image": None,
+        "e_aurc_image": None,
+    }
+    image_scores, image_errors = image_level_scores(known_items + unknown_items, scorer)
+    if image_scores:
+        row["n_images"] = len(image_scores)
+        row["aurc_image"] = _round_or_none(aurc(image_scores, image_errors))
+        row["e_aurc_image"] = _round_or_none(excess_aurc(image_scores, image_errors))
+    return row
 
 
 def ap_from_tp(conf: np.ndarray, tp: np.ndarray, n_gt: int) -> float:
@@ -778,7 +944,12 @@ def best_cost_threshold(known_items: list[dict], unknown_items: list[dict],
     scores = [float(s) for s in scores if s is not None and not math.isnan(float(s))]
     if not scores:
         return float("nan"), float("nan"), {}
-    grid = np.linspace(min(scores), max(scores), max(2, int(n_candidates)))
+    # 拒识条件是 score > τ，因此网格必须外扩到 [min-ε, max+ε]：
+    # 否则 τ 取不到 min 以下，"分数恰好等于最小值"的未知框永远无法拒识，
+    # 代价比扫描会出现各比例 τ 完全相同、转人工率不随代价变化。
+    lo = float(min(scores)) - 1e-6
+    hi = float(max(scores)) + 1e-6
+    grid = np.linspace(lo, hi, max(2, int(n_candidates)))
     best = (float("nan"), float("inf"), {})
     for tau in grid:
         detail = evaluate_at_threshold(known_items, unknown_items, n_unknown_gt, scorer,
@@ -787,6 +958,34 @@ def best_cost_threshold(known_items: list[dict], unknown_items: list[dict],
         if cost < best[1]:
             best = (float(tau), float(cost), detail)
     return best[0], best[1], best[2]
+
+
+def scan_cost_ratios(known_items: list[dict], unknown_items: list[dict],
+                     n_unknown_gt: int, scorer: str, ratios,
+                     n_images: int | None = None, n_candidates: int = 100
+                     ) -> list[dict]:
+    """对每个 C_mis:C_ref 比例复用 best_cost_threshold，返回逐比例的最优工作点。
+
+    C_ref 固定为 1，比例即 C_mis；预算按**图像数**归一（期望代价 / 图像总数），
+    使不同规模的验证集可横向比较。比例非正数直接跳过。
+    """
+    rows: list[dict] = []
+    for ratio in ratios:
+        ratio = float(ratio)
+        if not ratio > 0:
+            continue
+        tau, cost, detail = best_cost_threshold(
+            known_items, unknown_items, n_unknown_gt, scorer, ratio, 1.0, n_candidates)
+        rows.append({
+            "cost_ratio": ratio,
+            "tau": _round_or_none(tau),
+            "misdiagnosis_rate": detail.get("misdiagnosis_rate"),
+            "referral_rate": detail.get("referral_rate"),
+            "expected_cost": _round_or_none(cost),
+            "expected_cost_per_image": (round(float(cost) / n_images, 6)
+                                        if n_images and cost == cost else None),
+        })
+    return rows
 
 
 def scorer_summary(scorer: str, known_items: list[dict], unknown_items: list[dict],
@@ -921,6 +1120,50 @@ def plot_risk_coverage(path: Path, known_items: list[dict], unknown_items: list[
     plt.close(fig)
 
 
+def write_cost_ratio_csv(path: Path, rows: list[dict]) -> None:
+    """代价比扫描结果落盘（与 metrics.json 的 cost_ratio_sweep.rows 同源）。"""
+    fields = ["cost_ratio", "tau", "misdiagnosis_rate", "referral_rate",
+              "expected_cost", "expected_cost_per_image"]
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: ("" if row.get(key) is None else row.get(key))
+                             for key in fields})
+
+
+def plot_decision_curve(path: Path, rows: list[dict], recommend_ratio: float,
+                        scorer: str) -> None:
+    """决策曲线：上=代价比（对数横轴）vs 每图归一化期望代价，下=代价比 vs 转人工率。"""
+    valid = [row for row in rows if row.get("expected_cost_per_image") is not None]
+    if not valid:
+        return
+    ratios = [row["cost_ratio"] for row in valid]
+    costs = [row["expected_cost_per_image"] for row in valid]
+    referral = [row.get("referral_rate") or 0.0 for row in valid]
+
+    fig, axes = plt.subplots(2, 1, figsize=(6.6, 6.6), dpi=150, sharex=True)
+    axes[0].plot(ratios, costs, marker="o", color="#1f77b4", lw=2)
+    axes[0].set_ylabel("期望代价 / 图像数")
+    axes[0].set_title(f"代价比决策曲线（{scorer}，C_ref=1）")
+    axes[0].grid(alpha=0.3, which="both")
+
+    axes[1].plot(ratios, referral, marker="o", color="#ff7f0e", lw=2)
+    axes[1].set_xlabel("代价比 C_mis : C_ref（对数轴）")
+    axes[1].set_ylabel("转人工率（Referred / 全部检测框）")
+    axes[1].set_ylim(0.0, max(0.1, max(referral) * 1.15))
+    axes[1].grid(alpha=0.3, which="both")
+
+    for ax in axes:
+        ax.set_xscale("log")
+        ax.axvline(float(recommend_ratio), color="#d62728", ls="--", lw=1.2,
+                   label=f"推荐代价比 {recommend_ratio:g}")
+        ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
 def write_markdown(path: Path, report: dict) -> None:
     r = report
     data = r["data"]
@@ -1016,9 +1259,74 @@ def write_markdown(path: Path, report: dict) -> None:
         "",
     ]
 
+    sp = r.get("selective_prediction") or {}
+    sp_scorers = sp.get("scorers") or {}
+    lines += [
+        "## 7. 选择性预测（框级，与阈值无关）",
+        "",
+        "| 打分器 | N(框) | AURC | E-AURC | coverage@5% | coverage@10% | N(图) | AURC(图级) | E-AURC(图级) |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for name, row in sp_scorers.items():
+        lines.append(
+            f"| {name} | {row['n_known'] + row['n_unknown']} | {_fmt(row.get('aurc'))} | "
+            f"{_fmt(row.get('e_aurc'))} | "
+            f"{_fmt(row.get('coverage_at_5pct'), pct=True)} | "
+            f"{_fmt(row.get('coverage_at_10pct'), pct=True)} | "
+            f"{row.get('n_images') or '—'} | {_fmt(row.get('aurc_image'))} | "
+            f"{_fmt(row.get('e_aurc_image'))} |")
+    lines += [
+        "",
+        "表注：AURC 按「分数越大越像已知」计算——未知度打分器已先取负，覆盖率 0→1 时"
+        "逐个覆盖并累计错误率后做梯形积分。**标准 AURC 在覆盖率到 1 时必含错误，"
+        "完美分离也不为 0（其值约等于未知占比）**；E-AURC 是相对完美排序基线（错误全排"
+        "最后）的超出量，完美分离才为 0。两者必须同时报告。coverage@r 表示错误率不超过"
+        " r 时的最大覆盖率。",
+        "",
+        "图级口径：同一张图取最可疑框（未知度最大）代表整图，图内只要有一个未知框未被"
+        "拒识就记该图错误；只有最可疑框低于 τ、图内全部框都被保留时该图才算被覆盖。",
+        "",
+        "> 口径说明：现有匹配对已知框要求**同类且 IoU ≥ 0.5**，因此已知侧的类别错误"
+        "（未匹配上的 FP）不会进入这个选择集；AURC 衡量的是「保留已知框 vs 拒识未知框」"
+        "的权衡，这是已知简化，论文引用该指标时必须一并说明。",
+        "",
+    ]
+
+    sweep = r.get("cost_ratio_sweep") or {}
+    sweep_rows = sweep.get("rows") or []
+    lines += [
+        f"## 8. 代价比扫描（C_ref 固定为 1，打分器 {sweep.get('scorer', '—')}）",
+        "",
+        "| C_mis : C_ref | τ | 误诊率 | 转人工率 | 期望代价 | 期望代价/图 |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in sweep_rows:
+        lines.append(
+            f"| {row['cost_ratio']:g} : 1 | {_fmt(row.get('tau'))} | "
+            f"{_fmt(row.get('misdiagnosis_rate'), pct=True)} | "
+            f"{_fmt(row.get('referral_rate'), pct=True)} | "
+            f"{_fmt(row.get('expected_cost'))} | "
+            f"{_fmt(row.get('expected_cost_per_image'))} |")
+    rec = sweep.get("recommend") or {}
+    if rec:
+        lines += [
+            "",
+            f"推荐工作点（代价比 {rec['cost_ratio']:g} : 1，τ={_fmt(rec.get('tau'))}）："
+            f"误诊率 {_fmt(rec.get('misdiagnosis_rate'), pct=True)}，"
+            f"转人工率 {_fmt(rec.get('referral_rate'), pct=True)}，"
+            f"期望代价/图 {_fmt(rec.get('expected_cost_per_image'))}。",
+        ]
+    lines += [
+        "",
+        "表注：代价比越大越保守（分数可分时 τ 下移、转人工率上升；"
+        "若未知框与已知框分数不可分则可能保持不变）；"
+        "τ 仍在已知+未知数据上扫描得到，仅用于代价敏感性分析。",
+        "",
+    ]
+
     km = r["known_map"]
     lines += [
-        "## 7. 拒识前的已知类检测精度（由已有预测重算）",
+        "## 9. 拒识前的已知类检测精度（由已有预测重算）",
         "",
         f"- 已知类 mAP@0.5：{_fmt(km['map50'])} ｜ mAP@0.5:0.95：{_fmt(km['map50_95'])}",
         "",
@@ -1032,7 +1340,7 @@ def write_markdown(path: Path, report: dict) -> None:
         lines += [f"- 检测框与命中 anchor 的 IoU 中位数：{r['anchor_iou_median']:.3f}"
                   "（用于自检特征/概率提取位置是否可靠）", ""]
 
-    lines += ["## 8. 结论", "", f"> {r['conclusion']}", ""]
+    lines += ["## 10. 结论", "", f"> {r['conclusion']}", ""]
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -1089,6 +1397,20 @@ def main(argv: list[str] | None = None) -> int:
     if not 0.0 <= args.calib_ratio <= 1.0:
         print("[错误] --calib-ratio 必须在 0~1 之间")
         return 1
+    if not args.recommend_ratio > 0:
+        print("[错误] --recommend-ratio 必须为正数")
+        return 1
+    try:
+        cost_ratios = [float(x) for x in re.split(r"[,，]", args.cost_ratios) if x.strip()]
+    except ValueError:
+        print("[错误] --cost-ratios 需要逗号分隔的正数，如 1,2,5,10")
+        return 1
+    if not cost_ratios or any(r <= 0 for r in cost_ratios):
+        print("[错误] --cost-ratios 需要逗号分隔的正数，如 1,2,5,10")
+        return 1
+    if not any(abs(r - args.recommend_ratio) < 1e-9 for r in cost_ratios):
+        cost_ratios.append(args.recommend_ratio)   # 保证推荐工作点也出现在扫描表里
+    cost_ratios = sorted(set(cost_ratios))
     selected = [x.strip().lower() for x in args.scorer.replace("，", ",").split(",") if x.strip()]
     unknown_scorers = [s for s in selected if s not in SCORERS]
     if unknown_scorers:
@@ -1242,6 +1564,24 @@ def main(argv: list[str] | None = None) -> int:
             "cost_optimal": summary["cost_optimal"],
         }
 
+    # ---- 选择性预测（框级 + 图级）----
+    selective: dict[str, dict] = {}
+    for scorer in available:
+        selective[scorer] = selective_metrics(known_items, unknown_items, scorer)
+
+    # ---- 代价比扫描（C_ref 固定为 1）----
+    n_images = len(data["known_images"]) + len(data["unknown_images"])
+    sweep_rows = scan_cost_ratios(known_items, unknown_items, n_unknown_gt, primary,
+                                  cost_ratios, n_images)
+    recommend_row = next((row for row in sweep_rows
+                          if abs(row["cost_ratio"] - args.recommend_ratio) < 1e-9), None)
+    for row in sweep_rows:
+        tag = "（推荐）" if row is recommend_row else ""
+        print(f"  [代价比] {row['cost_ratio']:>6g}:1 τ={_fmt(row.get('tau'))} "
+              f"误诊率={_fmt(row.get('misdiagnosis_rate'), pct=True)} "
+              f"转人工率={_fmt(row.get('referral_rate'), pct=True)} "
+              f"代价/图={_fmt(row.get('expected_cost_per_image'))}{tag}")
+
     known_map = compute_map50_95(known["images"], known_names)
     anchor_ious = [it["anchor_iou"] for it in known_items + unknown_items
                    if it["anchor_iou"] == it["anchor_iou"]]
@@ -1287,6 +1627,31 @@ def main(argv: list[str] | None = None) -> int:
         "rq1": rq1,
         "rq2": rq2,
         "rejection": rejection,
+        "selective_prediction": {
+            "scores_direction": "分数越大越像已知（未知度已取负）；覆盖 = 不拒识",
+            "scorers": selective,
+            "image_level": {
+                "implemented": bool(selective),
+                "definition": ("同图多个框时取最可疑框（未知度最大）代表整图；"
+                               "图内含未知框且未被拒识即记该图错误"),
+                "reason": "" if selective else "没有可用的检测框打分结果，无法做图级聚合",
+            },
+            "notes": [
+                "已知框要求同类且 IoU ≥ 0.5，已知侧的类别错误（未匹配 FP）不进入选择集；"
+                "AURC 只衡量保留已知框 vs 拒识未知框的权衡，属已知简化。",
+                "AURC 为标准定义（覆盖率必到 1，完美分离也不为 0，约等于未知占比）；"
+                "E-AURC 为相对完美排序基线的超出量，完美分离为 0。两者需同时报告。",
+            ],
+        },
+        "cost_ratio_sweep": {
+            "scorer": primary,
+            "cost_ref": 1.0,
+            "n_images": n_images,
+            "recommend_ratio": args.recommend_ratio,
+            "ratios": cost_ratios,
+            "rows": sweep_rows,
+            "recommend": recommend_row,
+        },
         "known_map": known_map,
         "anchor_iou_median": anchor_median,
         "primary_scorer": primary,
@@ -1321,19 +1686,32 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # noqa: BLE001 - 画图失败不应丢掉已有指标
         print(f"[警告] 绘制风险-覆盖率曲线失败：{e}")
 
+    cost_csv_path = out_dir / "cost_ratio.csv"
+    write_cost_ratio_csv(cost_csv_path, sweep_rows)
+    decision_png = out_dir / "decision_curve.png"
+    try:
+        plot_decision_curve(decision_png, sweep_rows, args.recommend_ratio, primary)
+    except Exception as e:  # noqa: BLE001
+        print(f"[警告] 绘制代价比决策曲线失败：{e}")
+
     elapsed = time.time() - t0
     print(f"\n[完成] 已知框 {len(known_items)}，未知 GT {n_unknown_gt}，"
           f"检出未知 {len(unknown_items)}，耗时 {elapsed:.0f}s")
     for scorer in available:
         row = rq2[scorer]
         print(f"  {scorer:<12} AUROC={_fmt(row['auroc'])} AUPR={_fmt(row['auprc'])} "
-              f"FPR@95TPR={_fmt(row['fpr_at_95tpr'])}")
+              f"FPR@95TPR={_fmt(row['fpr_at_95tpr'])} "
+              f"AURC={_fmt(selective[scorer]['aurc'])} "
+              f"E-AURC={_fmt(selective[scorer]['e_aurc'])} "
+              f"AURC_img={_fmt(selective[scorer]['aurc_image'])}")
     for name, reason in unavailable.items():
         print(f"  [降级] {name}：{reason}")
     print(f"[输出] {json_path}")
     print(f"[输出] {md_path}")
     print(f"[输出] {csv_path}")
     print(f"[输出] {png_path}")
+    print(f"[输出] {cost_csv_path}")
+    print(f"[输出] {decision_png}")
     print(f"[结论] {report['conclusion']}")
     return 0
 
