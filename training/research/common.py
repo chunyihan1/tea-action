@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -308,6 +309,26 @@ def class_name(names: list[str], cid: int, fallback: dict | None = None) -> str:
     if fallback and cid in fallback:
         return str(fallback[cid])
     return f"class_{cid}"
+
+
+def require_weights(path: str, *, hint: str = "") -> Path:
+    """评估入口的 fail-fast 守卫：权重缺失时立刻退出，绝不降级到模拟检测。
+
+    运行时页面在缺权重时会切到 SimDetector 用合成帧「演示」，
+    这对论文实验是致命的：数字来自模拟器却看不出来。所有评估脚本
+    必须先过这一关，缺失就中止，让失败显式暴露。
+    """
+    p = Path(path)
+    if not p.is_file():
+        print(f"[错误] 权重文件不存在：{p}", file=sys.stderr)
+        print("       论文实验禁止降级到模拟检测，缺少权重时直接中止。", file=sys.stderr)
+        if hint:
+            print(f"       {hint}", file=sys.stderr)
+        raise SystemExit(2)
+    if p.stat().st_size < 4096:
+        print(f"[错误] 权重文件过小（{p.stat().st_size} 字节），疑似损坏：{p}", file=sys.stderr)
+        raise SystemExit(2)
+    return p
 
 
 def summarize_arrays(tp: np.ndarray, fp: np.ndarray, fn: np.ndarray) -> dict:

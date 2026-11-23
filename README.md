@@ -2,6 +2,27 @@
 
 基于 **Python + Streamlit** 的轻量化茶园气象服务系统。通过 **和风天气 API** 获取茶园实时与预报气象数据，接入 **百度伏羲/文心大模型**（千帆平台）完成气象灾害研判、病虫害风险分析与农事智能问答；内置 **MySQL 数据库** 支撑用户注册登录与个人茶园管理，并集成了 **风险预警中心** 与 **农事建议** 模块，构建集 **数据监测、风险预警、智能决策、农事指导** 于一体的茶园气象服务系统。
 
+## ⚠️ 实现状态与使用边界（先读这一节）
+
+本仓库同时包含**论文实验工件**与**演示系统**，两者不混用：
+
+| 归属 | 位置 | 状态 | 用途 |
+|---|---|---|---|
+| 论文实验工具 | `training/research/` | 已实现，可复现 | 数据审计、基准对比、显著性检验、误差分析、开放集拒识评估；产出论文表格与图 |
+| YOLO 训练与标定 | `training/` | 已实现 | `train_yolo.py` 训练、`calibrate_conf.py` 阈值标定、`pseudo_label.py` 伪标注 |
+| 病虫害识别页 | `pages/7_病虫害识别.py` | 已实现 | 上传照片本地推理，不调用大模型 |
+| 气象 / 风险 / 问答 / 农事 | `pages/`、`src/` | 已实现 | 依赖和风天气 API 与大模型 API Key；未配置时走演示数据 |
+| 执行器自动控制 | `src/agent/`、`src/executor/` | **仅状态机演示** | 未接真实继电器/阀门；仅有单次与每日时长上限 |
+| 多摄像头监控台 | `src/vision/capture.py` | 代码完成，**未实机验证** | RTSP/USB 接入依赖具体设备 |
+| 服务鉴权 | `src/ws_server.py` | **未实现** | `/api/*` 与 `/ws` 无 token 校验，`user_id` 由客户端自报 |
+
+**安全声明（务必遵守）**
+
+- 这是演示与科研原型，**不是生产系统**：没有鉴权、没有审计、没有故障安全回路。
+- **禁止**绑定到 `0.0.0.0` 或暴露到公网/校园网；只允许 `127.0.0.1` 本机访问。
+- **禁止**把执行器输出接到真实喷药/灌溉硬件。缺权重或掉线时视觉链路会降级到合成演示帧，据此驱动物理会造成误喷。
+- 论文中的性能数字**只能**来自 `training/research/` 的离线评估，不得引用页面演示结果。
+
 ## ✨ 功能特性
 
 - **用户系统**：注册 / 登录 / 退出，密码加盐哈希存储（PBKDF2），游客模式可免登录浏览演示茶园
@@ -117,12 +138,12 @@ tea-garden-weather-service/
 python -m venv .venv
 # Windows: .venv\Scripts\activate   |   Linux/macOS: source .venv/bin/activate
 
-# 2) 轻薄本运行时先装 CPU 版 torch（避免 pip 默认拉 2GB+ 的 CUDA 包，如果电脑有RTX3050及以上显卡的情况下，推荐安装GUP版，这样yolo模型训练和推理速度将会大幅提升）
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-
-# 3) 安装其余全部依赖
+# 2) 安装运行时依赖（已锁版本）
 pip install -r requirements.txt
-pip install ultralytics opencv-python
+
+# 3) 安装视觉/训练依赖（体积大，单独一份；无独显的轻薄本用下面这行的 CPU 版）
+#    有 NVIDIA 显卡：pip install -r requirements-vision.txt
+pip install -r requirements-vision.txt --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 > **conda 可选**：依赖均为标准 PyPI 包，与 anaconda 无绑定关系——conda 只是环境管理工具，用 `venv + pip` 完全等价。

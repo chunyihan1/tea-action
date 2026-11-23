@@ -35,7 +35,8 @@ from pathlib import Path
 import numpy as np
 
 from common import (class_name, get_preds, load_data_yaml, match_image,
-                    micro_prf, read_gt, resolve_split, summarize_arrays)
+                    micro_prf, read_gt, require_weights, resolve_split,
+                    summarize_arrays)
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,6 +78,7 @@ def run_model(weights: str, images: list[Path], labels: list[Path],
     }
     t0 = time.time()
     try:
+        require_weights(weights, hint="请确认 training 产出的 best.pt 路径")
         from ultralytics import YOLO
 
         model = YOLO(weights)

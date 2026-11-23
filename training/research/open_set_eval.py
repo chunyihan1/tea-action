@@ -53,7 +53,7 @@ import numpy as np
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 from common import (get_preds, iou_xyxy, load_data_yaml, match_image,  # noqa: E402
-                    read_gt, resolve_split)
+                    read_gt, require_weights, resolve_split)
 
 # matplotlib 无显示环境：只保存图片不弹窗（与 training/train_yolo.py 一致）
 import matplotlib  # noqa: E402
@@ -1436,6 +1436,7 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        require_weights(args.model, hint="请先完成第 3 步训练，或确认 --model 指向 6 类权重")
         from ultralytics import YOLO
 
         yolo = YOLO(args.model)

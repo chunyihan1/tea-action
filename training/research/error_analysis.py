@@ -30,7 +30,8 @@ from pathlib import Path
 from PIL import Image
 
 from common import (best_iou_any, class_name, get_preds, iou_xyxy,
-                    load_data_yaml, match_image, read_gt, resolve_split)
+                    load_data_yaml, match_image, read_gt, require_weights,
+                    resolve_split)
 
 CSV_FIELDS = ["type", "image", "class_id", "class_name", "conf",
               "iou", "area_ratio", "w", "h", "size_bin"]
@@ -97,6 +98,7 @@ def save_crop(image_path: Path, box: tuple[float, float, float, float],
 def collect(model_path: str, images: list[Path], labels: list[Path],
             names: list[str], args: argparse.Namespace) -> tuple[list[dict], int, int]:
     """逐图推理并收集 FP / FN 记录，返回 (记录列表, GT 总数, 预测总数)。"""
+    require_weights(model_path, hint="请确认 training 产出的 best.pt 路径")
     from ultralytics import YOLO
 
     model = YOLO(model_path)

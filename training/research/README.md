@@ -1,5 +1,19 @@
 # 论文级实验方案（training/research）
 
+## 边界：这里的东西属于论文，不属于演示系统
+
+| 归属 | 目录 | 说明 |
+|---|---|---|
+| 论文工件 | `training/research/` | 数据审计、基准、显著性、误差分析、开放集拒识、多种子实验 |
+| 演示系统 | `src/`、`pages/`、`app.py` | Streamlit 页面 + WebSocket 服务，**无鉴权、不得接硬件、不得暴露到局域网** |
+
+两条硬规则：
+
+1. `src/`、`pages/`、`app.py` 不得 import 本目录任何模块（当前已满足，可用 `grep -rn "training.research" src pages app.py` 复核）；
+2. 评估入口 fail-fast（`benchmark.py` 例外：多模型对比时单模型失败记为 `status=error` 继续，便于横向排表）：权重缺失时 `require_weights()` 直接以退出码 2 中止，**绝不降级到模拟检测**——模拟出的数字会污染论文。
+
+演示系统在缺权重时会切到 `SimDetector` 用合成帧演示，这是页面功能，与论文实验无关。
+
 本目录提供可复现的实验工具，产出投稿中文核心（南核 / CSCD）与 SCI 期刊所需的表格、
 统计检验与审计证据。所有命令均在**项目根目录**（`tea-action/`）下执行，
 输出默认写到 `research_out/`。
