@@ -16,6 +16,10 @@
   - 阈值：τ_calib 在已知类检测框上按 --calib-ratio 取分位数（主结果）；
     τ_cost 在已知+未知数据上扫 100 个阈值使 C_mis·误诊数 + C_ref·复核数 最小。
     **测试集调阈值只用于分析，论文主结果必须用 τ_calib**；
+  - calib / eval 协议：--calib-list / --eval-list 显式指定，或自动探测
+    <split-dir>/known/eval_split/{calib,eval}.txt；阈值校准、Mahalanobis 均值/协方差、
+    原型统计只在 calib 上拟合，AUROC/AUPR/FPR@95TPR/AURC/E-AURC/coverage@risk/
+    代价曲线/已知类 mAP 只在 eval 上计算；两者都给不出时回退为 known/val 全量（旧行为）；
   - hook 因 Ultralytics 版本差异失败时优雅降级：只保留 MSP（取检测框 conf），
     并在 metrics.json / metrics.md 里写明 scorer_unavailable 原因，不崩溃；
   - 指标全部自行实现（AUROC 用秩和、AP 用 all-point 插值、FPR@TPR 用分位数），
@@ -90,6 +94,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.25, help="检测置信度阈值，默认 0.25")
     parser.add_argument("--imgsz", type=int, default=640, help="推理分辨率，默认 640")
     parser.add_argument("--device", default="auto", help="auto / cpu / 0，默认 auto")
+    parser.add_argument("--calib-list", default=None,
+                        help="阈值校准与特征拟合图像清单（每行一个相对 --split-dir 的路径）；"
+                             "需同时给 --eval-list")
+    parser.add_argument("--eval-list", default=None,
+                        help="指标上报图像清单（每行一个相对 --split-dir 的路径）；"
+                             "未给且存在 <split-dir>/known/eval_split/ 时自动启用")
     parser.add_argument("--out", default=None, help="输出目录，默认 <split-dir>/eval")
     return parser.parse_args(argv)
 
@@ -736,7 +746,7 @@ def infer_known(model, images: list[Path], labels: list[Path],
                 "box": p["box"],
                 "name": model_names.get(int(p["cls"]), str(p["cls"])),
             })
-        image_records.append({"preds": preds, "gts": gts})
+        image_records.append({"image": str(images[i]), "preds": preds, "gts": gts})
         matched = match_image(preds, gts, IOU_MATCH)
         for pred, gt_index, _ in matched["tp"]:
             scored = box_unknown_scores(bundle, b, pred["box"], (h, w)) if bundle else None
@@ -988,13 +998,20 @@ def scan_cost_ratios(known_items: list[dict], unknown_items: list[dict],
     return rows
 
 
-def scorer_summary(scorer: str, known_items: list[dict], unknown_items: list[dict],
-                   n_unknown_gt: int, args: argparse.Namespace) -> dict:
+def scorer_summary(scorer: str, calib_items: list[dict], eval_items: list[dict],
+                   unknown_items: list[dict], n_unknown_gt: int,
+                   args: argparse.Namespace) -> dict:
+    """单个打分器的可分性 + 拒识指标。
+
+    协议分离时：τ_calib 只用 calib 集标定，AUROC/AUPR/FPR@95TPR 与拒识后指标
+    全部在 eval 集上计算；calib 与 eval 为同一批时即旧行为。
+    """
     # 指标函数口径是"分数越大越像已知"，故这里取未知度的相反数；
     # 阈值（拒识）仍用原始未知度，二者不可混用。
-    known_u = [it["scores"][scorer] for it in known_items if scorer in it["scores"]]
+    calib_u = [it["scores"][scorer] for it in calib_items if scorer in it["scores"]]
+    eval_u = [it["scores"][scorer] for it in eval_items if scorer in it["scores"]]
     unknown_u = [it["scores"][scorer] for it in unknown_items if scorer in it["scores"]]
-    known_scores = [-v for v in known_u]
+    known_scores = [-v for v in eval_u]
     unknown_scores = [-v for v in unknown_u]
     row = {
         "n_known": len(known_scores),
@@ -1002,20 +1019,21 @@ def scorer_summary(scorer: str, known_items: list[dict], unknown_items: list[dic
         "auroc": _round_or_none(auroc(known_scores, unknown_scores)),
         "auprc": _round_or_none(auprc(known_scores, unknown_scores)),
         "fpr_at_95tpr": _round_or_none(fpr_at_tpr(known_scores, unknown_scores, 0.95)),
+        "n_calib": len(calib_u),
         "tau_calib": None,
         "calib": None,
         "tau_cost": None,
         "cost": None,
         "cost_optimal": None,
     }
-    if known_u:
-        tau = threshold_at_fpr(known_u, args.calib_ratio)
+    if calib_u:
+        tau = threshold_at_fpr(calib_u, args.calib_ratio)
         row["tau_calib"] = round(float(tau), 6)
-        row["calib"] = evaluate_at_threshold(known_items, unknown_items, n_unknown_gt,
+        row["calib"] = evaluate_at_threshold(eval_items, unknown_items, n_unknown_gt,
                                              scorer, tau, args.cost_mis, args.cost_ref)
-    if known_u or unknown_u:
+    if eval_u or unknown_u:
         tau_cost, cost, detail = best_cost_threshold(
-            known_items, unknown_items, n_unknown_gt, scorer,
+            eval_items, unknown_items, n_unknown_gt, scorer,
             args.cost_mis, args.cost_ref)
         row["tau_cost"] = _round_or_none(tau_cost)
         row["cost"] = _round_or_none(cost)
@@ -1181,9 +1199,13 @@ def write_markdown(path: Path, report: dict) -> None:
         "",
         "## 1. 数据",
         "",
-        f"- known/val：{data['known_val_images']} 张图，参与打分的已知 TP 框 {data['known_boxes']} 个",
+        f"- known/val：{data['known_val_images']} 张图；阈值校准集 calib "
+        f"{data.get('calib_boxes', 0)} 个已知框，指标评估集 eval {data['known_boxes']} 个已知框",
         f"- unknown/val：{data['unknown_val_images']} 张图，未知 GT 框 {data['unknown_gt_boxes']} 个，"
         f"其中被检测出 {data['unknown_detected_boxes']} 个",
+        f"- 评估协议：calib {r['protocol']['calib_images']} 图 / "
+        f"eval {r['protocol']['eval_images']} 图 / unknown {r['protocol']['unknown_images']} 图"
+        f"（calib 来源：{r['protocol']['calib_source']}）",
         "",
     ]
     if r["scorer_unavailable"]:
@@ -1392,6 +1414,84 @@ def _load_pair(split_dir: Path) -> dict:
     }
 
 
+def _path_key(path) -> str:
+    """图像路径归一化（绝对路径 + 平台大小写规则），用于 calib / eval 集合比对。"""
+    try:
+        return os.path.normcase(str(Path(path).resolve()))
+    except OSError:
+        return os.path.normcase(str(path))
+
+
+def read_image_list(path: Path, split_dir: Path) -> tuple[list[str], int]:
+    """读取"相对 split 根目录"的图像清单，返回 (归一化路径键列表, 清单内条目数)。"""
+    keys: list[str] = []
+    total = 0
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        total += 1
+        p = Path(name)
+        keys.append(_path_key(p if p.is_absolute() else split_dir / p))
+    return keys, total
+
+
+def resolve_protocol(split_dir: Path, calib_list: str | None,
+                     eval_list: str | None) -> dict | None:
+    """决定 calib / eval 协议：显式参数优先，其次自动探测 known/eval_split。
+
+    返回 None 表示沿用旧行为（calib 与 eval 同为 known/val）；
+    否则返回 {"calib": set[str], "eval": set[str], "source": "arg"|"auto"}。
+    """
+    explicit = [bool(calib_list), bool(eval_list)]
+    if any(explicit):
+        if not all(explicit):
+            raise ValueError("--calib-list 与 --eval-list 必须同时提供")
+        result = {"source": "arg"}
+        pairs = {"calib": Path(str(calib_list)), "eval": Path(str(eval_list))}
+    else:
+        auto_dir = Path(split_dir) / "known" / "eval_split"
+        calib_path, eval_path = auto_dir / "calib.txt", auto_dir / "eval.txt"
+        if not (calib_path.is_file() and eval_path.is_file()):
+            return None
+        result = {"source": "auto"}
+        pairs = {"calib": calib_path, "eval": eval_path}
+
+    for name, path in pairs.items():
+        if not path.is_file():
+            raise FileNotFoundError(f"{name} 清单不存在：{path}")
+        keys, total = read_image_list(path, Path(split_dir))
+        if not keys:
+            raise ValueError(f"{name} 清单为空：{path}")
+        result[name] = set(keys)
+        result[f"{name}_entries"] = total
+        result[f"{name}_missing"] = len([k for k in keys
+                                         if not Path(k).is_file()])
+    overlap = result["calib"] & result["eval"]
+    if overlap:
+        raise ValueError(f"calib 与 eval 清单存在 {len(overlap)} 张重叠图像，"
+                         "两者必须无交集")
+    return result
+
+
+def protocol_block(protocol: dict | None, known_images: int,
+                   unknown_images: int) -> dict:
+    """metrics.json 的 protocol 字段：calib / eval / unknown 图数与来源。"""
+    if protocol is None:
+        return {
+            "calib_images": int(known_images),
+            "eval_images": int(known_images),
+            "unknown_images": int(unknown_images),
+            "calib_source": "fallback",
+        }
+    return {
+        "calib_images": len(protocol["calib"]),
+        "eval_images": len(protocol["eval"]),
+        "unknown_images": int(unknown_images),
+        "calib_source": protocol["source"],
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if not 0.0 <= args.calib_ratio <= 1.0:
@@ -1434,6 +1534,28 @@ def main(argv: list[str] | None = None) -> int:
     known_names = [canon(n) for n in data["known_names"]]
     out_dir = Path(args.out) if args.out else split_dir / "eval"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # calib / eval 协议：显式清单优先，其次自动探测 known/eval_split/
+    try:
+        protocol = resolve_protocol(split_dir, args.calib_list, args.eval_list)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[错误] {e}")
+        return 1
+    protocol_info = protocol_block(protocol, len(data["known_images"]),
+                                   len(data["unknown_images"]))
+    if protocol is not None:
+        print(f"[协议] 阈值校准集（calib）：{protocol['calib_entries']} 图清单，"
+              f"指标评估集（eval）：{protocol['eval_entries']} 图清单"
+              f"（来源：{'显式参数' if protocol['source'] == 'arg' else '自动探测 eval_split'}）")
+        for name in ("calib", "eval"):
+            if protocol.get(f"{name}_missing"):
+                print(f"[警告] {name} 清单中有 {protocol[f'{name}_missing']} 张图像不存在")
+    else:
+        print("[协议] 未找到 calib/eval 清单：沿用旧行为，"
+              "阈值校准与指标评估都使用 known/val")
+    print(f"协议：calib={protocol_info['calib_images']} 图 / "
+          f"eval={protocol_info['eval_images']} 图 / "
+          f"unknown={protocol_info['unknown_images']} 图")
 
     try:
         require_weights(args.model, hint="请先完成第 3 步训练，或确认 --model 指向 6 类权重")
@@ -1517,22 +1639,43 @@ def main(argv: list[str] | None = None) -> int:
         print("       可尝试降低 --conf（如 0.01）后重跑。")
         return 1
 
-    # ---- 特征分布（Mahalanobis / Prototype）----
-    stats, stats_reason = fit_feature_stats(known_items, len(known_names))
+    # ---- calib / eval 拆分：先用 calib 拟合，再用 eval 上报 ----
+    if protocol is not None:
+        calib_items = [it for it in known_items if _path_key(it["image"]) in protocol["calib"]]
+        eval_items = [it for it in known_items if _path_key(it["image"]) in protocol["eval"]]
+        unassigned = len(known_items) - len(calib_items) - len(eval_items)
+        if unassigned:
+            print(f"[警告] {unassigned} 个已知框所在图像不在 calib/eval 清单中，已忽略")
+        if not calib_items or not eval_items:
+            print(f"[错误] calib 或 eval 子集没有可用已知检测框（calib {len(calib_items)}，"
+                  f"eval {len(eval_items)}）；请检查清单路径或降低 --conf")
+            return 1
+        print(f"[信息] 阈值校准集（calib）：{len(calib_items)} 框；"
+              f"指标评估集（eval）：{len(eval_items)} 框；unknown：{len(unknown_items)} 框")
+    else:
+        # 旧行为：校准与上报共用 known/val
+        calib_items = eval_items = known_items
+
+    # ---- 特征分布（Mahalanobis / Prototype）：只在 calib 上拟合 ----
+    stats, stats_reason = fit_feature_stats(calib_items, len(known_names))
     if stats is None:
         for name in FEATURE_SCORERS:
             unavailable.setdefault(name, stats_reason)
     else:
-        add_feature_scores(known_items, stats)
+        add_feature_scores(calib_items, stats)
+        if eval_items is not calib_items:
+            add_feature_scores(eval_items, stats)
         add_feature_scores(unknown_items, stats)
 
-    # ---- 融合分数 ----
+    # ---- 融合分数：权重在 calib + unknown 上拟合 ----
     if all(name not in unavailable for name in FUSION_INPUTS):
-        fusion, fusion_reason = fit_fusion(known_items + unknown_items)
+        fusion, fusion_reason = fit_fusion(calib_items + unknown_items)
         if fusion is None:
             unavailable["fusion"] = fusion_reason
         else:
-            apply_fusion(known_items, fusion)
+            apply_fusion(calib_items, fusion)
+            if eval_items is not calib_items:
+                apply_fusion(eval_items, fusion)
             apply_fusion(unknown_items, fusion)
     else:
         missing = [n for n in FUSION_INPUTS if n in unavailable]
@@ -1549,7 +1692,8 @@ def main(argv: list[str] | None = None) -> int:
     rejection: dict[str, dict] = {}
     rq2: dict[str, dict] = {}
     for scorer in available:
-        summary = scorer_summary(scorer, known_items, unknown_items, n_unknown_gt, args)
+        summary = scorer_summary(scorer, calib_items, eval_items, unknown_items,
+                                 n_unknown_gt, args)
         rq2[scorer] = {
             "n_known": summary["n_known"],
             "n_unknown": summary["n_unknown"],
@@ -1565,14 +1709,14 @@ def main(argv: list[str] | None = None) -> int:
             "cost_optimal": summary["cost_optimal"],
         }
 
-    # ---- 选择性预测（框级 + 图级）----
+    # ---- 选择性预测（框级 + 图级）：只在 eval 上计算 ----
     selective: dict[str, dict] = {}
     for scorer in available:
-        selective[scorer] = selective_metrics(known_items, unknown_items, scorer)
+        selective[scorer] = selective_metrics(eval_items, unknown_items, scorer)
 
-    # ---- 代价比扫描（C_ref 固定为 1）----
-    n_images = len(data["known_images"]) + len(data["unknown_images"])
-    sweep_rows = scan_cost_ratios(known_items, unknown_items, n_unknown_gt, primary,
+    # ---- 代价比扫描（C_ref 固定为 1）：只在 eval 上计算 ----
+    n_images = protocol_info["eval_images"] + len(data["unknown_images"])
+    sweep_rows = scan_cost_ratios(eval_items, unknown_items, n_unknown_gt, primary,
                                   cost_ratios, n_images)
     recommend_row = next((row for row in sweep_rows
                           if abs(row["cost_ratio"] - args.recommend_ratio) < 1e-9), None)
@@ -1583,7 +1727,11 @@ def main(argv: list[str] | None = None) -> int:
               f"转人工率={_fmt(row.get('referral_rate'), pct=True)} "
               f"代价/图={_fmt(row.get('expected_cost_per_image'))}{tag}")
 
-    known_map = compute_map50_95(known["images"], known_names)
+    eval_records = known["images"]
+    if protocol is not None:
+        eval_records = [rec for rec in known["images"]
+                        if _path_key(rec["image"]) in protocol["eval"]]
+    known_map = compute_map50_95(eval_records, known_names)
     anchor_ious = [it["anchor_iou"] for it in known_items + unknown_items
                    if it["anchor_iou"] == it["anchor_iou"]]
     anchor_median = float(np.median(anchor_ious)) if anchor_ious else float("nan")
@@ -1593,11 +1741,28 @@ def main(argv: list[str] | None = None) -> int:
                                          if n_unknown_gt else None),
         "unknown_mean_conf": (round(float(np.mean([it["conf"] for it in unknown_items])), 4)
                               if unknown_items else None),
-        "known_mean_conf": (round(float(np.mean([it["conf"] for it in known_items])), 4)
-                            if known_items else None),
+        "known_mean_conf": (round(float(np.mean([it["conf"] for it in eval_items])), 4)
+                            if eval_items else None),
         "unknown_detected_boxes": len(unknown_items),
         "unknown_gt_boxes": n_unknown_gt,
     }
+
+    if protocol is not None:
+        notes = [
+            "协议：阈值 τ_calib、Mahalanobis/Prototype 均值协方差、融合权重仅在 known/val 的 "
+            "calib 子集上拟合，未知类不参与；",
+            "所有上报指标（AUROC/AUPR/FPR@95TPR/AURC/E-AURC/coverage@risk/代价曲线/已知类 mAP）"
+            "只在 eval 子集上计算，calib 与 eval 无交集；",
+            "τ_cost 在 eval 已知 + 全部 unknown 上扫描，仅用于 RQ5 代价敏感性分析；",
+            "融合权重拟合仍使用 unknown 检测框，存在轻度乐观偏差，论文需注明。",
+        ]
+    else:
+        notes = [
+            "主结果阈值 τ_calib 只在 known/val 的已知类检测框上按固定误拒率标定，测试/验证集不调参；",
+            "τ_cost 在已知+未知验证数据上扫描，仅用于 RQ5 代价敏感性分析；",
+            "Mahalanobis/Prototype 的类均值与共享协方差仅在 known/val 上拟合，未知类不参与；",
+            "融合权重在同一个 known/val + unknown/val 上拟合，存在轻度乐观偏差，论文需注明。",
+        ]
 
     report = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1614,13 +1779,15 @@ def main(argv: list[str] | None = None) -> int:
         "calib_ratio": args.calib_ratio,
         "cost_mis": args.cost_mis,
         "cost_ref": args.cost_ref,
+        "protocol": protocol_info,
         "scorers_requested": selected,
         "scorers_available": available,
         "scorer_unavailable": unavailable,
         "data": {
             "known_val_images": len(data["known_images"]),
             "unknown_val_images": len(data["unknown_images"]),
-            "known_boxes": len(known_items),
+            "known_boxes": len(eval_items),
+            "calib_boxes": len(calib_items),
             "unknown_gt_boxes": n_unknown_gt,
             "unknown_detected_boxes": len(unknown_items),
             "anchor_parse_failures": known["failed_boxes"] + unknown["failed_boxes"],
@@ -1656,12 +1823,7 @@ def main(argv: list[str] | None = None) -> int:
         "known_map": known_map,
         "anchor_iou_median": anchor_median,
         "primary_scorer": primary,
-        "notes": [
-            "主结果阈值 τ_calib 只在 known/val 的已知类检测框上按固定误拒率标定，测试/验证集不调参；",
-            "τ_cost 在已知+未知验证数据上扫描，仅用于 RQ5 代价敏感性分析；",
-            "Mahalanobis/Prototype 的类均值与共享协方差仅在 known/val 上拟合，未知类不参与；",
-            "融合权重在同一个 known/val + unknown/val 上拟合，存在轻度乐观偏差，论文需注明。",
-        ],
+        "notes": notes,
         "conclusion": "",
     }
     report["conclusion"] = build_conclusion(report)
@@ -1678,11 +1840,11 @@ def main(argv: list[str] | None = None) -> int:
     tau_cost = (primary_row["tau_cost"] if primary_row["tau_cost"] is not None
                 else float("nan"))
     csv_path = out_dir / "scores.csv"
-    write_scores_csv(csv_path, known_items + unknown_items, primary, tau_calib, tau_cost)
+    write_scores_csv(csv_path, eval_items + unknown_items, primary, tau_calib, tau_cost)
 
     png_path = out_dir / "risk_coverage.png"
     try:
-        plot_risk_coverage(png_path, known_items, unknown_items, n_unknown_gt,
+        plot_risk_coverage(png_path, eval_items, unknown_items, n_unknown_gt,
                            primary, tau_calib, tau_cost, args)
     except Exception as e:  # noqa: BLE001 - 画图失败不应丢掉已有指标
         print(f"[警告] 绘制风险-覆盖率曲线失败：{e}")
@@ -1696,8 +1858,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[警告] 绘制代价比决策曲线失败：{e}")
 
     elapsed = time.time() - t0
-    print(f"\n[完成] 已知框 {len(known_items)}，未知 GT {n_unknown_gt}，"
-          f"检出未知 {len(unknown_items)}，耗时 {elapsed:.0f}s")
+    print(f"\n[完成] 校准已知框 {len(calib_items)}，评估已知框 {len(eval_items)}，"
+          f"未知 GT {n_unknown_gt}，检出未知 {len(unknown_items)}，耗时 {elapsed:.0f}s")
     for scorer in available:
         row = rq2[scorer]
         print(f"  {scorer:<12} AUROC={_fmt(row['auroc'])} AUPR={_fmt(row['auprc'])} "

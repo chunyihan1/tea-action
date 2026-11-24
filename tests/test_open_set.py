@@ -9,6 +9,7 @@
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -62,8 +63,10 @@ def test_make_open_set_split(tmp_path):
     data_root = tmp_path / "dataset"
     _make_dataset(data_root)
     out = tmp_path / "open_set"
+    # 固定旧协议：unknown 只用 val、不拆 calib/eval，验证历史行为可复现
     rc = mos.main(["--data-root", str(data_root), "--out", str(out),
-                   "--splits", "S1", "--mode", "copy"])
+                   "--splits", "S1", "--mode", "copy",
+                   "--unknown-scope", "val", "--val-split", "0"])
     assert rc == 0
 
     group = out / "S1"
@@ -108,6 +111,155 @@ def test_split_mode_list_and_short_name(tmp_path):
                    "--splits", "leaf rust", "--mode", "list"])
     assert rc == 0
     assert not (out / "S1").exists()
+
+
+# ============================================================
+# 1b. unknown 来源与 calib/eval 拆分
+# ============================================================
+def _make_dataset_with_excluded(root: Path) -> None:
+    """4 类数据集（Black rot / Healthy / Leaf rust / disease），额外放入只含 disease 的图。
+
+    用于验证：只有"含留出类标签"的图像才进 unknown，只含排除类（disease）的图被跳过。
+    """
+    names = ["Black rot", "Healthy", "Leaf rust", "disease"]
+    plan = {
+        "train": {"Black rot": 2, "Healthy": 2, "Leaf rust": 2, "disease": 1},
+        "valid": {"Black rot": 2, "Healthy": 2, "Leaf rust": 2, "disease": 1},
+    }
+    for split, counts in plan.items():
+        img_dir = root / split / "images"
+        lbl_dir = root / split / "labels"
+        img_dir.mkdir(parents=True)
+        lbl_dir.mkdir(parents=True)
+        for cid, name in enumerate(names):
+            for k in range(counts[name]):
+                stem = f"{name.replace(' ', '_')}_{split}_{k}"
+                Image.new("RGB", (64, 64), color=(40 * cid + 10, 60 + 20 * k, 180)).save(
+                    img_dir / f"{stem}.png")
+                (lbl_dir / f"{stem}.txt").write_text(
+                    f"{cid} 0.500000 0.500000 0.400000 0.400000\n", encoding="utf-8")
+        # 一张同时含留出类（Leaf rust）与其他类（disease）的混合图：
+        # 默认策略下应被整图排除，不得进入 unknown
+        stem = f"Mixed_{split}_0"
+        Image.new("RGB", (64, 64), color=(200, 200, 10)).save(img_dir / f"{stem}.png")
+        (lbl_dir / f"{stem}.txt").write_text(
+            "2 0.400000 0.500000 0.300000 0.300000\n"
+            "3 0.700000 0.500000 0.200000 0.200000\n", encoding="utf-8")
+    (root / "data.yaml").write_text(
+        "path: {}\n".format(root.as_posix())
+        + "train: train/images\nval: valid/images\n"
+        + "names:\n  0: Black rot\n  1: Healthy\n  2: Leaf rust\n  3: disease\n",
+        encoding="utf-8",
+    )
+
+
+def test_unknown_scope_all_includes_train(tmp_path):
+    """--unknown-scope all 的 unknown 图像数应大于仅 val，且包含 train 分片的留出类图。"""
+    data_root = tmp_path / "dataset"
+    _make_dataset(data_root)
+
+    out_val = tmp_path / "out_val"
+    rc = mos.main(["--data-root", str(data_root), "--out", str(out_val),
+                   "--splits", "S1", "--unknown-scope", "val", "--val-split", "0"])
+    assert rc == 0
+    names_val = sorted(p.name for p in (out_val / "S1" / "unknown" / "images" / "val")
+                       .rglob("*") if p.is_file())
+
+    out_all = tmp_path / "out_all"
+    rc = mos.main(["--data-root", str(data_root), "--out", str(out_all),
+                   "--splits", "S1", "--unknown-scope", "all", "--val-split", "0"])
+    assert rc == 0
+    names_all = sorted(p.name for p in (out_all / "S1" / "unknown" / "images" / "val")
+                       .rglob("*") if p.is_file())
+
+    assert len(names_val) == 2          # valid 中 Leaf rust 2 张
+    assert len(names_all) == 4          # + train 中 Leaf rust 2 张
+    assert len(names_all) > len(names_val)
+    assert any("_train_" in name for name in names_all)
+
+    report = (out_all / "S1" / "split_report.md").read_text(encoding="utf-8")
+    assert "unknown 来源" in report and "train 2 图" in report
+    assert "unknown 与 known 类别不相交" in report
+    assert "❌" not in report
+
+
+def test_calib_eval_disjoint_and_union_equals_val(tmp_path):
+    """calib 与 eval 无交集，并集等于原 known/val 图像集合。"""
+    data_root = tmp_path / "dataset"
+    _make_dataset(data_root)
+    out = tmp_path / "open_set"
+    rc = mos.main(["--data-root", str(data_root), "--out", str(out),
+                   "--splits", "S1", "--val-split", "0.5"])
+    assert rc == 0
+
+    group = out / "S1"
+    calib = [x.strip() for x in (group / "known" / "eval_split" / "calib.txt")
+             .read_text(encoding="utf-8").splitlines() if x.strip()]
+    evals = [x.strip() for x in (group / "known" / "eval_split" / "eval.txt")
+             .read_text(encoding="utf-8").splitlines() if x.strip()]
+    original = {f"known/images/val/{p.name}"
+                for p in (group / "known" / "images" / "val").iterdir() if p.is_file()}
+
+    assert calib and evals
+    assert set(calib).isdisjoint(set(evals))
+    assert set(calib) | set(evals) == original
+    assert all(line.startswith("known/images/val/") for line in calib + evals)
+    # data_known.yaml 的 val 仍指向 known/images/val（训练期不变）
+    assert "val: images/val" in (group / "data_known.yaml").read_text(encoding="utf-8")
+
+    report = (group / "split_report.md").read_text(encoding="utf-8")
+    assert "calib 2 图" in report and "eval 2 图" in report
+
+
+def test_unknown_only_held_class_images(tmp_path):
+    """只含排除类（disease）的图不得进 unknown；混合图默认整图排除。"""
+    data_root = tmp_path / "dataset"
+    _make_dataset_with_excluded(data_root)
+    out = tmp_path / "open_set"
+    rc = mos.main(["--data-root", str(data_root), "--out", str(out),
+                   "--splits", "S1", "--unknown-scope", "all", "--val-split", "0"])
+    assert rc == 0
+
+    group = out / "S1"
+    unknown_imgs = [p.name for p in (group / "unknown" / "images" / "val").rglob("*")
+                    if p.is_file()]
+    # 默认 --unknown-mixed exclude：val Leaf_rust 2 + train Leaf_rust 2 = 4；
+    # 只含 disease 的图被跳过，混合图（Leaf rust + disease）整图排除
+    assert len(unknown_imgs) == 4
+    assert not any(name.startswith("Disease") or name.startswith("disease")
+                   for name in unknown_imgs)
+    assert not any(name.startswith("Mixed") for name in unknown_imgs)
+
+    known_val = [p.name for p in (group / "known" / "images" / "val").iterdir()
+                 if p.is_file()]
+    assert len(known_val) == 4                     # Black rot 2 + Healthy 2
+    assert not any(name.startswith("Mixed") for name in known_val)
+    assert not any(name.startswith("disease") for name in known_val)
+
+    report = (group / "split_report.md").read_text(encoding="utf-8")
+    assert "unknown 与 known 类别不相交" in report
+    assert "已整图排除" in report
+
+
+def test_unknown_mixed_relabel_is_legacy_behavior(tmp_path):
+    """--unknown-mixed relabel 复现旧行为：混合图进 unknown，全部框改写为 class 0。"""
+    data_root = tmp_path / "dataset"
+    _make_dataset_with_excluded(data_root)
+    out = tmp_path / "open_set"
+    rc = mos.main(["--data-root", str(data_root), "--out", str(out),
+                   "--splits", "S1", "--unknown-scope", "all", "--val-split", "0",
+                   "--unknown-mixed", "relabel"])
+    assert rc == 0
+
+    group = out / "S1"
+    unknown_imgs = [p.name for p in (group / "unknown" / "images" / "val").rglob("*")
+                    if p.is_file()]
+    # val Leaf_rust 2 + val Mixed 1 + train Leaf_rust 2 + train Mixed 1 = 6
+    assert len(unknown_imgs) == 6
+    assert any(name.startswith("Mixed") for name in unknown_imgs)
+
+    report = (group / "split_report.md").read_text(encoding="utf-8")
+    assert "改写为 unknown" in report
 
 
 # ============================================================
@@ -208,6 +360,86 @@ def test_cost_ratio_sweep_more_conservative_at_higher_ratio():
 
 
 # ============================================================
+# 2c. calib / eval 协议（函数级，不跑真实推理）
+# ============================================================
+def _known_item(score: float, image: str, gt: int = 0) -> dict:
+    return {
+        "source": "known", "image": image, "gt_cls": gt, "conf": 0.5,
+        "anchor_iou": 1.0, "feature": None, "scores": {"msp": score},
+    }
+
+
+def _eval_args() -> SimpleNamespace:
+    return SimpleNamespace(calib_ratio=0.5, cost_mis=10.0, cost_ref=1.0)
+
+
+def test_resolve_protocol_auto_and_protocol_block(tmp_path):
+    """存在 known/eval_split/ 时自动启用；protocol 字段写到 metrics.json。"""
+    split = tmp_path / "S1"
+    split_dir = split / "known" / "eval_split"
+    split_dir.mkdir(parents=True)
+    (split_dir / "calib.txt").write_text(
+        "known/images/val/a.jpg\nknown/images/val/b.jpg\n", encoding="utf-8")
+    (split_dir / "eval.txt").write_text(
+        "known/images/val/c.jpg\n", encoding="utf-8")
+
+    protocol = ose.resolve_protocol(split, None, None)
+    assert protocol is not None and protocol["source"] == "auto"
+    assert len(protocol["calib"]) == 2 and len(protocol["eval"]) == 1
+
+    block = ose.protocol_block(protocol, known_images=3, unknown_images=7)
+    assert block == {"calib_images": 2, "eval_images": 1,
+                     "unknown_images": 7, "calib_source": "auto"}
+
+    # 显式清单优先于自动探测
+    calib2 = tmp_path / "calib2.txt"
+    eval2 = tmp_path / "eval2.txt"
+    calib2.write_text("known/images/val/a.jpg\n", encoding="utf-8")
+    eval2.write_text("known/images/val/c.jpg\n", encoding="utf-8")
+    explicit = ose.resolve_protocol(split, str(calib2), str(eval2))
+    assert explicit["source"] == "arg"
+    assert len(explicit["calib"]) == 1 and len(explicit["eval"]) == 1
+
+    # calib 与 eval 重叠必须报错（不允许泄漏）
+    bad = tmp_path / "bad.txt"
+    bad.write_text("known/images/val/a.jpg\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        ose.resolve_protocol(split, str(calib2), str(bad))
+
+
+def test_protocol_fallback_is_legacy_behavior(tmp_path):
+    """没有清单且不给参数时回退为 known/val 全量（旧行为）。"""
+    empty = tmp_path / "S1"
+    empty.mkdir()
+    assert ose.resolve_protocol(empty, None, None) is None
+    assert ose.protocol_block(None, known_images=4, unknown_images=9) == {
+        "calib_images": 4, "eval_images": 4,
+        "unknown_images": 9, "calib_source": "fallback",
+    }
+
+    calib = [_known_item(0.1, "a"), _known_item(0.2, "b"),
+             _known_item(0.3, "c"), _known_item(0.4, "d")]
+    row = ose.scorer_summary("msp", calib, calib, [], 0, _eval_args())
+    assert row["n_known"] == 4 and row["n_calib"] == 4
+    assert row["tau_calib"] == pytest.approx(
+        ose.threshold_at_fpr([it["scores"]["msp"] for it in calib], 0.5))
+    assert row["calib"]["known_boxes"] == 4
+
+
+def test_scorer_summary_calibrates_on_calib_reports_on_eval():
+    """τ 只由 calib 决定，n_known / 拒识指标只统计 eval。"""
+    calib = [_known_item(0.1, "a"), _known_item(0.2, "b"),
+             _known_item(0.3, "c"), _known_item(0.4, "d")]
+    evals = [_known_item(0.5 + 0.1 * i, f"e{i}") for i in range(6)]
+    row = ose.scorer_summary("msp", calib, evals, [], 0, _eval_args())
+
+    assert row["tau_calib"] == pytest.approx(0.25)   # calib 中位数
+    assert row["n_calib"] == 4
+    assert row["n_known"] == 6                       # 只报 eval
+    assert row["calib"]["known_boxes"] == 6
+
+
+# ============================================================
 # 3. CLI --help
 # ============================================================
 def _run_help(script: Path) -> subprocess.CompletedProcess:
@@ -219,7 +451,9 @@ def test_help_flags():
     split_help = _run_help(RESEARCH / "make_open_set_split.py")
     assert split_help.returncode == 0
     assert "--data-root" in split_help.stdout and "--mode" in split_help.stdout
+    assert "--unknown-scope" in split_help.stdout and "--val-split" in split_help.stdout
 
     eval_help = _run_help(RESEARCH / "open_set_eval.py")
     assert eval_help.returncode == 0
     assert "--split-dir" in eval_help.stdout and "--calib-ratio" in eval_help.stdout
+    assert "--calib-list" in eval_help.stdout and "--eval-list" in eval_help.stdout

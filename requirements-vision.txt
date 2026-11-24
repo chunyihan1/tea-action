@@ -1,11 +1,14 @@
 # 视觉与训练依赖（YOLO 推理 / 训练 / 摄像头）
 # 体积大（torch 约 2~3 GB），单独安装，不要让纯前端使用者被迫下载。
 #
+# 版本与论文实验环境一致（RTX 4070 Laptop / Python 3.11.9）：
+#   torch 2.6.0+cu124、ultralytics 8.4.211
 # 有 NVIDIA 显卡（CUDA 版）：
 #   pip install -r requirements-vision.txt
 # 无独显 / 只想跑 CPU（体积更小）：
 #   pip install -r requirements-vision.txt --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.10.0
-torchvision==0.25.0
-ultralytics==8.4.202
-opencv-python==5.0.0.93
+torch==2.6.0
+torchvision==0.21.0
+ultralytics==8.4.211
+# opencv 未在实验机上单独登记版本，安装后用 `pip show opencv-python` 回填
+opencv-python>=4.8.0

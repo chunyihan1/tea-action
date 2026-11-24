@@ -14,6 +14,32 @@
 
 演示系统在缺权重时会切到 `SimDetector` 用合成帧演示，这是页面功能，与论文实验无关。
 
+## 开放集拒识（OSD）实验入口
+
+```powershell
+# 1) 看统计（不落盘）
+python training\research\make_open_set_split.py --data-root training\datasets\tea_leaf_disease --mode list
+
+# 2) 生成划分（默认 unknown 收集留出类的 train+val+test 全部图像；val 按 5:5 拆 calib/eval）
+python training\research\make_open_set_split.py --data-root training\datasets\tea_leaf_disease --splits S1,S5
+
+# 3) 评估（自动识别 known/eval_split/，阈值只在 calib 拟合、指标只在 eval 上报）
+python training\research\open_set_eval.py --model research_out\runs\S1_s42\weights\best.pt --split-dir research_out\open_set\S1
+```
+
+关键默认值（论文里必须写明）：
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `--unknown-scope` | `all` | unknown 评估集收集留出类在 train/val/test 的全部图像；设 `val` 可复现旧行为 |
+| `--unknown-mixed` | `exclude` | 同时含其他类别框的混合图整图排除（避免已知类框被改写成 unknown 而虚高召回）；设 `relabel` 复现旧行为 |
+| `--val-split` | `0.5` | known/val 按 seed 确定性拆成 calib 与 eval，两者无交集；设 `0` 关闭 |
+| `--calib-list` / `--eval-list` | 自动探测 | 显式指定校准/评估清单，优先于 `known/eval_split/` |
+
+`metrics.json` 会写入 `protocol`（calib/eval/unknown 各多少图、来源是 auto/arg/fallback），便于论文附录复现。
+
+## 实验工具一览
+
 本目录提供可复现的实验工具，产出投稿中文核心（南核 / CSCD）与 SCI 期刊所需的表格、
 统计检验与审计证据。所有命令均在**项目根目录**（`tea-action/`）下执行，
 输出默认写到 `research_out/`。
