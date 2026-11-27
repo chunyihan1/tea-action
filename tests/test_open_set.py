@@ -296,7 +296,18 @@ def test_expected_cost_and_rejection_metrics():
     assert detail["undetected_rate"] == 0.4                      # 2/5
     assert detail["referred_boxes"] == 3                         # 1 已知 + 2 未知
     assert detail["referral_rate"] == 0.4286                     # 3/7，输出保留 4 位
+    assert detail["referral_rate_known"] == 0.25                 # 1/4，分母不含未知框
     assert detail["expected_cost"] == 13.0                       # 10*1 + 1*3
+
+
+def test_free_energy_direction():
+    """energy 未知度：越不自信分数越高，符号不能反（反了 AUROC 会掉到 0.1 附近）。"""
+    confident = ose.free_energy_unknown(np.array([10.0, 0.0, 0.0]))
+    flat = ose.free_energy_unknown(np.array([0.0, 0.0, 0.0]))
+    unsure = ose.free_energy_unknown(np.array([-10.0, -10.0, -10.0]))
+    assert flat > confident
+    assert unsure > flat
+    assert confident == pytest.approx(-10.0, abs=1e-3)
 
 
 def test_ap_from_tp_hand_computed():

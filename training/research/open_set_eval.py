@@ -70,7 +70,10 @@ plt.rcParams["axes.unicode_minus"] = False
 
 SCORERS = ("msp", "entropy", "energy", "mahalanobis", "proto", "fusion")
 FEATURE_SCORERS = ("mahalanobis", "proto")
-FUSION_INPUTS = ("energy", "mahalanobis", "proto")
+# fusion 只用方向正确、判别力已验证的打分器。
+# proto（Detect 输入特征的原型余弦距离）在实测中 AUROC≈0.50（等同随机），
+# 若混入融合会引入噪声并让权重拟合不稳定，故默认剔除，仅作为单独指标输出。
+FUSION_INPUTS = ("energy", "mahalanobis")
 IOU_MATCH = 0.5
 EPS = 1e-12
 
@@ -614,6 +617,21 @@ def _iou_vector(anchors: np.ndarray, box: np.ndarray) -> np.ndarray:
     return inter / np.maximum(union, EPS)
 
 
+def free_energy_unknown(logits: np.ndarray) -> float:
+    """Free energy 未知度分数：E = -logsumexp(logits)，越大越未知。
+
+    注意方向：logsumexp 越大表示模型越自信（越像已知），因此未知度必须取负号。
+    早期版本在这里多取了一次负号，导致 energy 的 AUROC 掉到 0.1~0.2
+    （等价于方向取反），此处固定为唯一实现，并由单测守护。
+    """
+    vector = np.asarray(logits, dtype=np.float64).ravel()
+    if vector.size == 0:
+        return 0.0
+    peak = float(np.max(vector))
+    logsumexp = peak + math.log(float(np.sum(np.exp(vector - peak))) + EPS)
+    return -logsumexp
+
+
 def box_unknown_scores(bundle: dict, batch_idx: int, box, orig_shape
                        ) -> dict | None:
     """为单个检测框计算 MSP / Entropy / Energy，并取出用于 Mahan./Proto 的特征向量。
@@ -650,8 +668,7 @@ def box_unknown_scores(bundle: dict, batch_idx: int, box, orig_shape
         else:  # 没有原始 logits 时用逆 sigmoid 还原，数值上有轻微偏差
             p = np.clip(probs, 1e-4, 1.0 - 1e-4)
             vector = np.log(p / (1.0 - p))
-        peak = float(np.max(vector))
-        energy = float(-(peak + math.log(np.sum(np.exp(vector - peak)) + EPS)))
+        energy = free_energy_unknown(vector)
 
         feat = bundle["feat"][batch_idx]         # [C, H, W]
         _, fh, fw = feat.shape
@@ -665,7 +682,7 @@ def box_unknown_scores(bundle: dict, batch_idx: int, box, orig_shape
         return {
             "msp": msp,
             "entropy": entropy,
-            "energy": -energy,                   # 统一为"越大越未知"
+            "energy": energy,                    # free energy：越大越未知（勿再取负）
             "energy_raw": energy,
             "feature": feat[:, gy, gx].astype(np.float64),
             "anchor_iou": float(ious[k]),
@@ -937,6 +954,9 @@ def evaluate_at_threshold(known_items: list[dict], unknown_items: list[dict],
         "referred_boxes": known_rejected + unknown_rejected,
         "referral_rate": (round((known_rejected + unknown_rejected) / total_boxes, 4)
                           if total_boxes else None),
+        # 只看已知类框的转人工率：分母不含"必然被拒识"的未知类框，
+        # 反映系统对正常输入的实际可用性，避免被 unknown 池规模稀释或放大。
+        "referral_rate_known": (round(known_rejected / known_n, 4) if known_n else None),
         "expected_cost": round(expected_cost(unknown_mis, known_rejected + unknown_rejected,
                                              cost_mis, cost_ref), 2),
     }
@@ -1246,8 +1266,8 @@ def write_markdown(path: Path, report: dict) -> None:
         "",
         "## 5. 拒识后指标（主结果用 calib τ）",
         "",
-        "| 打分器 | τ_calib | 已知误拒率 | 未知召回 | 误诊率 | 转人工率 | 期望代价 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 打分器 | τ_calib | 已知误拒率 | 未知召回 | 误诊率 | 转人工率(全部框) | 转人工率(已知框) | 期望代价 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, row in r["rejection"].items():
         calib = row.get("calib") or {}
@@ -1257,13 +1277,14 @@ def write_markdown(path: Path, report: dict) -> None:
             f"{_fmt(calib.get('unknown_recall'), pct=True)} | "
             f"{_fmt(calib.get('misdiagnosis_rate'), pct=True)} | "
             f"{_fmt(calib.get('referral_rate'), pct=True)} | "
+            f"{_fmt(calib.get('referral_rate_known'), pct=True)} | "
             f"{_fmt(calib.get('expected_cost'))} |")
     lines += [
         "",
         "## 6. 代价最优阈值（仅分析，不作为主结果）",
         "",
-        "| 打分器 | τ_cost | 已知误拒率 | 未知召回 | 误诊率 | 转人工率 | 期望代价 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 打分器 | τ_cost | 已知误拒率 | 未知召回 | 误诊率 | 转人工率(全部框) | 转人工率(已知框) | 期望代价 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, row in r["rejection"].items():
         opt = row.get("cost_optimal") or {}
@@ -1273,8 +1294,13 @@ def write_markdown(path: Path, report: dict) -> None:
             f"{_fmt(opt.get('unknown_recall'), pct=True)} | "
             f"{_fmt(opt.get('misdiagnosis_rate'), pct=True)} | "
             f"{_fmt(opt.get('referral_rate'), pct=True)} | "
+            f"{_fmt(opt.get('referral_rate_known'), pct=True)} | "
             f"{_fmt(opt.get('expected_cost'))} |")
     lines += [
+        "",
+        "> 转人工率(全部框) 的分母包含未知类框，未知类必然全部被拒识，因此该值随 unknown 池"
+        "规模上升；转人工率(已知框) 只统计已知类框，反映系统在正常输入上的可用性，"
+        "论文讨论应以它为准，两个口径都要报告。",
         "",
         "> ⚠ τ_cost 在已知+未知验证数据上扫描得到，仅用于 RQ5 代价敏感性分析；"
         "论文主结果必须报告 calib τ（阈值只在已知类验证集上按固定误拒率标定）。",
