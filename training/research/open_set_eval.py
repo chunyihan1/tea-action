@@ -58,6 +58,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 from common import (get_preds, iou_xyxy, load_data_yaml, match_image,  # noqa: E402
                     read_gt, require_weights, resolve_split)
+# McNemar 的 Holm-Bonferroni 多重比较校正直接复用 stats_eval，避免两份实现漂移
+from stats_eval import holm_bonferroni  # noqa: E402
 
 # matplotlib 无显示环境：只保存图片不弹窗（与 training/train_yolo.py 一致）
 import matplotlib  # noqa: E402
@@ -951,6 +953,13 @@ def evaluate_at_threshold(known_items: list[dict], unknown_items: list[dict],
         "misdiagnosis_rate": round(unknown_mis / n_unknown_gt, 4) if n_unknown_gt else None,
         "undetected_rate": (round((n_unknown_gt - unknown_n) / n_unknown_gt, 4)
                             if n_unknown_gt else None),
+        # 未知类"静默漏检"：检测器根本没框出的未知 GT。
+        # 误诊率 + 未知漏检率 + 未知召回率 = 1（分母均为未知 GT 总数）。
+        "unknown_detected_rate": round(unknown_n / n_unknown_gt, 4) if n_unknown_gt else None,
+        "unknown_detection_miss_rate": (round((n_unknown_gt - unknown_n) / n_unknown_gt, 4)
+                                        if n_unknown_gt else None),
+        "undetected_unknown_count": (int(n_unknown_gt - unknown_n)
+                                     if n_unknown_gt else None),
         "referred_boxes": known_rejected + unknown_rejected,
         "referral_rate": (round((known_rejected + unknown_rejected) / total_boxes, 4)
                           if total_boxes else None),
@@ -1009,8 +1018,11 @@ def scan_cost_ratios(known_items: list[dict], unknown_items: list[dict],
         rows.append({
             "cost_ratio": ratio,
             "tau": _round_or_none(tau),
+            "unknown_recall": detail.get("unknown_recall"),
             "misdiagnosis_rate": detail.get("misdiagnosis_rate"),
+            "unknown_detection_miss_rate": detail.get("unknown_detection_miss_rate"),
             "referral_rate": detail.get("referral_rate"),
+            "referral_rate_known": detail.get("referral_rate_known"),
             "expected_cost": _round_or_none(cost),
             "expected_cost_per_image": (round(float(cost) / n_images, 6)
                                         if n_images and cost == cost else None),
@@ -1067,6 +1079,89 @@ def _round_or_none(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return None if math.isnan(f) else round(f, 4)
+
+
+# ============================================================
+# 打分器两两 McNemar 检验（配对单位：检测框）
+# ============================================================
+def mcnemar_pair(b: int, c: int) -> dict:
+    """连续性校正 McNemar：χ² = (|b−c|−1)²/(b+c)，p = erfc(sqrt(χ²/2))。
+
+    b = α 判定正确而 β 错，c = α 错而 β 正确；两者都为 0 时 p=1。
+    不引入 scipy，与 stats_eval.mcnemar_test 的口径一致。
+    """
+    discordant = int(b) + int(c)
+    if discordant == 0:
+        chi2, p = 0.0, 1.0
+    else:
+        chi2 = (abs(int(b) - int(c)) - 1) ** 2 / discordant
+        p = math.erfc(math.sqrt(chi2 / 2.0))
+    return {"chi2": round(float(chi2), 4), "p_raw": round(float(p), 6)}
+
+
+def scorer_correctness(known_items: list[dict], unknown_items: list[dict],
+                       scorer: str, tau: float) -> dict[tuple[str, int], bool]:
+    """每个已检出框在该打分器 τ 下是否"判定正确"。
+
+    已知框：分数 ≤ τ（未被拒识）为正确；未知框：分数 > τ（被拒识）为正确。
+    缺少该打分器分数（如 fusion 未覆盖该框）的框不进入返回字典。
+    """
+    correct: dict[tuple[str, int], bool] = {}
+    for idx, item in enumerate(known_items):
+        value = item["scores"].get(scorer)
+        if value is None or value != value:   # NaN 视为缺失
+            continue
+        correct[("known", idx)] = bool(value <= tau)
+    for idx, item in enumerate(unknown_items):
+        value = item["scores"].get(scorer)
+        if value is None or value != value:
+            continue
+        correct[("unknown", idx)] = bool(value > tau)
+    return correct
+
+
+def scorer_mcnemar(known_items: list[dict], unknown_items: list[dict],
+                   rejection: dict, scorers) -> list[dict]:
+    """对任意两个打分器做配对 McNemar（各自用 τ_calib），并做 Holm 校正。
+
+    配对单位是检测框；只保留两个打分器都有分数的框（交集），
+    因此不同打分器对的样本量可能不同。返回列表写入 metrics.json 的
+    scorer_mcnemar 字段。
+    """
+    usable = [s for s in scorers
+              if (rejection.get(s) or {}).get("tau_calib") is not None]
+    correctness = {
+        s: scorer_correctness(known_items, unknown_items, s,
+                              float(rejection[s]["tau_calib"]))
+        for s in usable
+    }
+    pairs: list[dict] = []
+    for i in range(len(usable)):
+        for j in range(i + 1, len(usable)):
+            a, b_scorer = usable[i], usable[j]
+            shared = sorted(set(correctness[a]) & set(correctness[b_scorer]))
+            n_shared = len(shared)
+            n_b = sum(1 for key in shared
+                      if correctness[a][key] and not correctness[b_scorer][key])
+            n_c = sum(1 for key in shared
+                      if not correctness[a][key] and correctness[b_scorer][key])
+            stats = mcnemar_pair(n_b, n_c)
+            pairs.append({
+                "scorer_a": a,
+                "scorer_b": b_scorer,
+                "n_boxes": n_shared,
+                "b": int(n_b),
+                "c": int(n_c),
+                "chi2": stats["chi2"],
+                "p_raw": stats["p_raw"],
+                "p_holm": None,
+                "significant": False,
+            })
+    adjusted = holm_bonferroni([p["p_raw"] for p in pairs])
+    for pair, p_adj in zip(pairs, adjusted):
+        pair["p_holm"] = round(float(p_adj), 6)
+        pair["significant"] = bool(p_adj < 0.05)
+    return pairs
 
 
 # ============================================================
@@ -1160,7 +1255,8 @@ def plot_risk_coverage(path: Path, known_items: list[dict], unknown_items: list[
 
 def write_cost_ratio_csv(path: Path, rows: list[dict]) -> None:
     """代价比扫描结果落盘（与 metrics.json 的 cost_ratio_sweep.rows 同源）。"""
-    fields = ["cost_ratio", "tau", "misdiagnosis_rate", "referral_rate",
+    fields = ["cost_ratio", "tau", "unknown_recall", "misdiagnosis_rate",
+              "unknown_detection_miss_rate", "referral_rate", "referral_rate_known",
               "expected_cost", "expected_cost_per_image"]
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -1266,8 +1362,8 @@ def write_markdown(path: Path, report: dict) -> None:
         "",
         "## 5. 拒识后指标（主结果用 calib τ）",
         "",
-        "| 打分器 | τ_calib | 已知误拒率 | 未知召回 | 误诊率 | 转人工率(全部框) | 转人工率(已知框) | 期望代价 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 打分器 | τ_calib | 已知误拒率 | 未知召回 | 误诊率 | 未知漏检率 | 转人工率(全部框) | 转人工率(已知框) | 期望代价 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, row in r["rejection"].items():
         calib = row.get("calib") or {}
@@ -1276,6 +1372,7 @@ def write_markdown(path: Path, report: dict) -> None:
             f"{_fmt(calib.get('known_false_rejection_rate'), pct=True)} | "
             f"{_fmt(calib.get('unknown_recall'), pct=True)} | "
             f"{_fmt(calib.get('misdiagnosis_rate'), pct=True)} | "
+            f"{_fmt(calib.get('unknown_detection_miss_rate'), pct=True)} | "
             f"{_fmt(calib.get('referral_rate'), pct=True)} | "
             f"{_fmt(calib.get('referral_rate_known'), pct=True)} | "
             f"{_fmt(calib.get('expected_cost'))} |")
@@ -1283,8 +1380,8 @@ def write_markdown(path: Path, report: dict) -> None:
         "",
         "## 6. 代价最优阈值（仅分析，不作为主结果）",
         "",
-        "| 打分器 | τ_cost | 已知误拒率 | 未知召回 | 误诊率 | 转人工率(全部框) | 转人工率(已知框) | 期望代价 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 打分器 | τ_cost | 已知误拒率 | 未知召回 | 误诊率 | 未知漏检率 | 转人工率(全部框) | 转人工率(已知框) | 期望代价 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, row in r["rejection"].items():
         opt = row.get("cost_optimal") or {}
@@ -1293,6 +1390,7 @@ def write_markdown(path: Path, report: dict) -> None:
             f"{_fmt(opt.get('known_false_rejection_rate'), pct=True)} | "
             f"{_fmt(opt.get('unknown_recall'), pct=True)} | "
             f"{_fmt(opt.get('misdiagnosis_rate'), pct=True)} | "
+            f"{_fmt(opt.get('unknown_detection_miss_rate'), pct=True)} | "
             f"{_fmt(opt.get('referral_rate'), pct=True)} | "
             f"{_fmt(opt.get('referral_rate_known'), pct=True)} | "
             f"{_fmt(opt.get('expected_cost'))} |")
@@ -1301,6 +1399,11 @@ def write_markdown(path: Path, report: dict) -> None:
         "> 转人工率(全部框) 的分母包含未知类框，未知类必然全部被拒识，因此该值随 unknown 池"
         "规模上升；转人工率(已知框) 只统计已知类框，反映系统在正常输入上的可用性，"
         "论文讨论应以它为准，两个口径都要报告。",
+        "",
+        "> 三值恒等式：误诊率（未知框仍判为已知）+ 未知漏检率（未知 GT 完全未被检出）+ "
+        "未知召回率（未知框被拒识）= 1，三者分母都是未知 GT 总数。"
+        "**误诊率 0 不等于安全**：完全未检出的未知病斑既不报警也不转人工，"
+        "属于静默失败，必须与未知漏检率一起报告。",
         "",
         "> ⚠ τ_cost 在已知+未知验证数据上扫描得到，仅用于 RQ5 代价敏感性分析；"
         "论文主结果必须报告 calib τ（阈值只在已知类验证集上按固定误拒率标定）。",
@@ -1342,31 +1445,44 @@ def write_markdown(path: Path, report: dict) -> None:
 
     sweep = r.get("cost_ratio_sweep") or {}
     sweep_rows = sweep.get("rows") or []
+    rec_ratio = sweep.get("recommend_ratio")
     lines += [
-        f"## 8. 代价比扫描（C_ref 固定为 1，打分器 {sweep.get('scorer', '—')}）",
+        f"## 8. 代价比扫描完整表（C_ref 固定为 1，打分器 {sweep.get('scorer', '—')}）",
         "",
-        "| C_mis : C_ref | τ | 误诊率 | 转人工率 | 期望代价 | 期望代价/图 |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 代价比 | τ | 未知召回 | 误诊率 | 未知漏检率 | 转人工率(全部框) | 转人工率(已知框) | 期望代价 |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in sweep_rows:
-        lines.append(
-            f"| {row['cost_ratio']:g} : 1 | {_fmt(row.get('tau'))} | "
-            f"{_fmt(row.get('misdiagnosis_rate'), pct=True)} | "
-            f"{_fmt(row.get('referral_rate'), pct=True)} | "
-            f"{_fmt(row.get('expected_cost'))} | "
-            f"{_fmt(row.get('expected_cost_per_image'))} |")
+        is_recommend = (rec_ratio is not None
+                        and abs(row["cost_ratio"] - float(rec_ratio)) < 1e-9)
+        cells = [
+            f"{row['cost_ratio']:g} : 1" + ("（推荐工作点）" if is_recommend else ""),
+            _fmt(row.get("tau")),
+            _fmt(row.get("unknown_recall"), pct=True),
+            _fmt(row.get("misdiagnosis_rate"), pct=True),
+            _fmt(row.get("unknown_detection_miss_rate"), pct=True),
+            _fmt(row.get("referral_rate"), pct=True),
+            _fmt(row.get("referral_rate_known"), pct=True),
+            _fmt(row.get("expected_cost")),
+        ]
+        if is_recommend:   # 推荐代价比整行加粗，便于排版后一眼定位
+            cells = [f"**{cell}**" for cell in cells]
+        lines.append("| " + " | ".join(cells) + " |")
     rec = sweep.get("recommend") or {}
     if rec:
         lines += [
             "",
             f"推荐工作点（代价比 {rec['cost_ratio']:g} : 1，τ={_fmt(rec.get('tau'))}）："
+            f"未知召回 {_fmt(rec.get('unknown_recall'), pct=True)}，"
             f"误诊率 {_fmt(rec.get('misdiagnosis_rate'), pct=True)}，"
+            f"未知漏检率 {_fmt(rec.get('unknown_detection_miss_rate'), pct=True)}，"
             f"转人工率 {_fmt(rec.get('referral_rate'), pct=True)}，"
             f"期望代价/图 {_fmt(rec.get('expected_cost_per_image'))}。",
         ]
     lines += [
         "",
-        "表注：代价比越大越保守（分数可分时 τ 下移、转人工率上升；"
+        "表注：粗体行即 `--recommend-ratio` 对应的推荐工作点。"
+        "代价比越大越保守（分数可分时 τ 下移、转人工率上升；"
         "若未知框与已知框分数不可分则可能保持不变）；"
         "τ 仍在已知+未知数据上扫描得到，仅用于代价敏感性分析。",
         "",
@@ -1388,7 +1504,35 @@ def write_markdown(path: Path, report: dict) -> None:
         lines += [f"- 检测框与命中 anchor 的 IoU 中位数：{r['anchor_iou_median']:.3f}"
                   "（用于自检特征/概率提取位置是否可靠）", ""]
 
-    lines += ["## 10. 结论", "", f"> {r['conclusion']}", ""]
+    mcnemar_pairs = r.get("scorer_mcnemar") or []
+    lines += [
+        "## 10. 打分器两两 McNemar 配对检验",
+        "",
+        "判定单位是**检测框**：已知框未被拒识、或未知框被拒识，记为该打分器判定正确；"
+        "各打分器均使用自己的 τ_calib。",
+        "",
+        "| 打分器 A | 打分器 B | 配对框数 | b（A 对 B 错） | c（A 错 B 对） | χ² | 原始 p | Holm 校正 p | α=0.05 显著 |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | :---: |",
+    ]
+    for pair in mcnemar_pairs:
+        lines.append(
+            f"| {pair['scorer_a']} | {pair['scorer_b']} | {pair.get('n_boxes', '—')} | "
+            f"{pair['b']} | {pair['c']} | {_fmt(pair.get('chi2'))} | "
+            f"{_fmt(pair.get('p_raw'))} | {_fmt(pair.get('p_holm'))} | "
+            f"{'是' if pair.get('significant') else '否'} |")
+    if mcnemar_pairs:
+        lines += [
+            "",
+            "表注：χ² 已做连续性校正，df=1，p 由 `math.erfc` 解析计算（不依赖 scipy）；"
+            "Holm-Bonferroni 控制族错误率 FWER ≤ 0.05，论文正文应报告校正后 p。",
+            "",
+            "> 口径限制：配对只使用**两个打分器都有分数的已检出框**（交集），"
+            "缺少某个打分器分数的框（如 fusion 未覆盖的框）不参与该对检验；"
+            "完全未被检出的未知 GT 不在配对单位内，其影响由未知漏检率单独报告。",
+            "",
+        ]
+
+    lines += ["## 11. 结论", "", f"> {r['conclusion']}", ""]
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -1735,6 +1879,9 @@ def main(argv: list[str] | None = None) -> int:
             "cost_optimal": summary["cost_optimal"],
         }
 
+    # ---- 打分器两两 McNemar（框级配对，各自 τ_calib）：只在 eval/unknown 上统计 ----
+    mcnemar_pairs = scorer_mcnemar(eval_items, unknown_items, rejection, available)
+
     # ---- 选择性预测（框级 + 图级）：只在 eval 上计算 ----
     selective: dict[str, dict] = {}
     for scorer in available:
@@ -1846,6 +1993,7 @@ def main(argv: list[str] | None = None) -> int:
             "rows": sweep_rows,
             "recommend": recommend_row,
         },
+        "scorer_mcnemar": mcnemar_pairs,
         "known_map": known_map,
         "anchor_iou_median": anchor_median,
         "primary_scorer": primary,

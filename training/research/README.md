@@ -55,6 +55,9 @@ training/research/
   seed_study.py      多种子重复实验（train+val，输出 mean±std）
   domain_eval.py     跨域评估：多域 P/R/F1 + 95% CI + 相对 in-domain 的下降幅度
   make_splits.py     按组（茶园/批次）切分 train/val/test，输出可复查的 txt/json
+  make_open_set_split.py  开放集划分：6 组 LOCO + unknown 全量池 + calib/eval 拆分
+  open_set_eval.py   开放集拒识评估：6 打分器、AURC/覆盖率、代价比扫描、打分器 McNemar
+  aggregate_open_set.py   多次 run 的 metrics.json 聚合成 mean±std 论文表
   README.md          本文件
 ```
 
